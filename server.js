@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import got from "got";
 import * as cheerio from "cheerio";
-import qs from "qs";
+import { URL } from "url";
 
 const app = express();
 
@@ -28,8 +28,11 @@ const parsePriceNumber = (str) => {
   if (!str) return null;
   const cleaned = String(str)
     .replace(/\s/g, "")
-    .replace(/[^\d.,-]/g, "")
+    // Punkte als Tausendertrenner entfernen (1.299,00 -> 1299,00)
     .replace(/\.(?=\d{3}\b)/g, "")
+    // nur Ziffern, Komma, Punkt und Minus behalten
+    .replace(/[^\d,.\-]/g, "")
+    // deutsches Komma in Punkt
     .replace(",", ".");
   const num = parseFloat(cleaned);
   return Number.isFinite(num) ? num : null;
@@ -40,136 +43,144 @@ const extractMeta = ($) => {
     $('meta[property="og:title"]').attr("content") ||
     $("title").first().text()?.trim() ||
     null;
-  const image = $('meta[property="og:image"]').attr("content") || null;
-  return { title, image };
+
+  // twitter:image, og:image, image_src, itemprop=image
+  const ogImage =
+    $('meta[property="og:image"]').attr("content") ||
+    $('meta[name="twitter:image"]').attr("content") ||
+    $('link[rel="image_src"]').attr("href") ||
+    $('img[itemprop="image"]').attr("src") ||
+    null;
+
+  return { title, image: ogImage };
 };
 
-// ---------- Domainspezifische Extraktoren ----------
-const extractors = [
-  // eBay: stabil über OG/Meta/LD-JSON, danach sichtbarer Text
-  {
-    test: (url) => /ebay\./i.test(url),
-    run: ($) => {
-      let byMeta =
-        $('meta[property="og:price:amount"]').attr("content") ||
-        $('meta[itemprop="price"]').attr("content") ||
-        $('meta[name="twitter:data1"]').attr("content");
+const absolutize = (maybeUrl, base) => {
+  if (!maybeUrl) return null;
+  try {
+    return new URL(maybeUrl, base).toString();
+  } catch {
+    return null;
+  }
+};
 
-      let ldPrice = null;
-      let ldImage = null;
-      $('script[type="application/ld+json"]').each((_, el) => {
-        try {
-          const data = JSON.parse($(el).text());
-        const arr = Array.isArray(data) ? data : [data];
-          for (const o of arr) {
-            const p = o?.offers?.price || o?.offers?.lowPrice || o?.price;
-            if (!ldPrice && p) ldPrice = p;
-            const img =
-              (Array.isArray(o.image) ? o.image[0] : o.image) ||
-              o?.offers?.image ||
-              null;
-            if (!ldImage && img) ldImage = img;
-          }
-        } catch {}
-      });
+// ---------- Universal Extractor (schema.org + meta + heuristics) ----------
+const universalExtract = ($, pageUrl) => {
+  let price = null;
+  let image = null;
 
-      const byId =
-        $("#prcIsum, #mm-saleDscPrc").first().text() ||
-        $(".x-price-primary .ux-textspans").first().text() ||
-        $("span[itemprop='price']").first().text();
+  // 1) JSON-LD (schema.org Product / Offer)
+  $('script[type="application/ld+json"]').each((_, el) => {
+    if (price && image) return;
+    try {
+      const raw = $(el).text();
+      if (!raw) return;
+      const data = JSON.parse(raw);
+      const list = Array.isArray(data) ? data : [data];
 
-      const image =
-        $('meta[property="og:image"]').attr("content") ||
-        $("#icImg").attr("src") ||
-        $('img[aria-label]').first().attr("src") ||
-        ldImage ||
-        null;
+      for (const obj of list) {
+        if (!obj || typeof obj !== "object") continue;
 
-      const priceStr = byMeta || ldPrice || byId || "";
-      const price = parsePriceNumber(priceStr);
-      return { price, image };
-    },
-  },
+        // Product mit offers
+        const offers = obj.offers || obj.aggregateOffer || obj.aggregateOffers || obj.Offer || null;
+        const priceCandidate =
+          (offers && (offers.price || offers.lowPrice || offers.highPrice)) ||
+          obj.price ||
+          null;
 
-  // Amazon
-  {
-    test: (url) => /amazon\./i.test(url),
-    run: ($) => {
-      const byId = $("#priceblock_ourprice, #priceblock_dealprice, #corePrice_feature_div span.a-offscreen")
-        .first()
-        .text();
-      const byMeta = $('span[data-a-color="price"] .a-offscreen').first().text();
-      const price = parsePriceNumber(byId || byMeta);
-      return { price, image: null };
-    },
-  },
+        if (!price && priceCandidate) {
+          const n = parsePriceNumber(priceCandidate);
+          if (n) price = n;
+        }
 
-  // MediaMarkt / Saturn
-  {
-    test: (url) => /(mediamarkt|saturn)\./i.test(url),
-    run: ($) => {
-      const meta = $('meta[itemprop="price"]').attr("content");
-      let fromJson = null;
-      const jsonld = $('script[type="application/ld+json"]').first().html();
-      if (jsonld) {
-        try {
-          const data = JSON.parse(jsonld);
-          fromJson = parsePriceNumber(data?.offers?.price || data?.price);
-        } catch {}
+        const imageCand =
+          (Array.isArray(obj.image) ? obj.image[0] : obj.image) ||
+          (offers && offers.image) ||
+          null;
+
+        if (!image && imageCand) {
+          image = absolutize(imageCand, pageUrl);
+        }
+
+        if (price && image) break;
       }
-      const textSpan = $("span, div")
-        .filter((_, el) => $(el).text().match(/€/) && $(el).text().match(/\d/))
-        .first()
-        .text();
-      const price = parsePriceNumber(meta || fromJson || textSpan);
-      return { price, image: null };
-    },
-  },
+    } catch {
+      /* ignore malformed JSON-LD */
+    }
+  });
 
-  // Alternate / Mindfactory / Caseking
-  {
-    test: (url) => /(alternate|mindfactory|caseking)\./i.test(url),
-    run: ($) => {
-      const meta = $('meta[itemprop="price"]').attr("content");
-      const priceText = $(".price, .price__value, .m-product__price, .article_price, .pprice")
-        .first()
-        .text();
-      const price = parsePriceNumber(meta || priceText);
-      return { price, image: null };
-    },
-  },
+  // 2) Microdata / itemprop
+  if (!price) {
+    const micro = $('*[itemprop="price"]').first();
+    const val = micro.attr("content") || micro.text();
+    const n = parsePriceNumber(val);
+    if (n) price = n;
+  }
+  if (!image) {
+    const microImg = $('*[itemprop="image"]').first().attr("src");
+    if (microImg) image = absolutize(microImg, pageUrl);
+  }
 
-  // IKEA
-  {
-    test: (url) => /ikea\./i.test(url),
-    run: ($) => {
-      const meta = $('meta[property="product:price:amount"]').attr("content");
-      const text = $('[class*="price"]').first().text();
-      const price = parsePriceNumber(meta || text);
-      return { price, image: null };
-    },
-  },
+  // 3) Open Graph / Twitter
+  if (!price) {
+    const ogPrice =
+      $('meta[property="product:price:amount"]').attr("content") ||
+      $('meta[property="og:price:amount"]').attr("content") ||
+      $('meta[name="twitter:data1"]').attr("content") ||
+      null;
+    const n = parsePriceNumber(ogPrice);
+    if (n) price = n;
+  }
+  if (!image) {
+    const metaImg =
+      $('meta[property="og:image"]').attr("content") ||
+      $('meta[name="twitter:image"]').attr("content");
+    if (metaImg) image = absolutize(metaImg, pageUrl);
+  }
 
-  // Fallback (generisch)
-  {
-    test: () => true,
-    run: ($) => {
-      const candidates = [
-        $('meta[itemprop="price"]').attr("content"),
-        $('meta[property="product:price:amount"]').attr("content"),
-        $("span.price").first().text(),
-        $("div.price").first().text(),
-        $("span:contains('€')").first().text(),
-        $("div:contains('€')").first().text(),
-      ].filter(Boolean);
-      for (const c of candidates) {
-        const num = parsePriceNumber(c);
-        if (num) return { price: num, image: null };
+  // 4) Daten-Attribute / häufige Klassen
+  if (!price) {
+    const dataAttr =
+      $('[data-price]').attr('data-price') ||
+      $('[data-price-amount]').attr('data-price-amount') ||
+      $('[data-product-price]').attr('data-product-price') ||
+      null;
+    const n = parsePriceNumber(dataAttr);
+    if (n) price = n;
+  }
+
+  // 5) Heuristik im sichtbaren Text: €-Preise
+  if (!price) {
+    // Nimm den ersten realistischen Euro-Preis im Body
+    const bodyText = $("body").text();
+    const matches = bodyText.match(/(\d{1,3}(\.\d{3})*|\d+),\d{2}\s*€+/g);
+    if (matches && matches.length) {
+      // wähle den kleinsten sinnvollen Wert (> 0)
+      let best = null;
+      for (const m of matches) {
+        const n = parsePriceNumber(m);
+        if (!n || n <= 0) continue;
+        if (best == null || n < best) best = n;
       }
-      return { price: null, image: null };
-    },
-  },
-];
+      if (best) price = best;
+    }
+  }
+
+  // 6) Bild als Fallback: erstes großes Produktbild in der Seite
+  if (!image) {
+    const candImg =
+      $('img[alt*="produkt"], img[alt*="Product"], img[alt*="Artikel"]').first().attr("src") ||
+      $("img").filter((_, el) => {
+        const w = Number($(el).attr("width"));
+        const h = Number($(el).attr("height"));
+        return (w >= 120 && h >= 90) || (!isNaN(w) && w >= 120) || (!isNaN(h) && h >= 90);
+      }).first().attr("src") ||
+      null;
+    if (candImg) image = absolutize(candImg, pageUrl);
+  }
+
+  return { price, image };
+};
 
 // ---------- Preis aus Direktlink ----------
 app.get("/api/price", async (req, res) => {
@@ -191,7 +202,7 @@ app.get("/api/price", async (req, res) => {
 
     let html = null;
 
-    // 1) Direkt
+    // 1) Direkt abrufen
     try {
       html = await got(targetUrl, {
         headers,
@@ -205,7 +216,7 @@ app.get("/api/price", async (req, res) => {
       console.error("Direct fetch failed:", err.response?.statusCode, err.message);
     }
 
-    // 2) Fallback Reader
+    // 2) Fallback Reader (liefert gerenderten Text)
     if (!html) {
       const readerUrl = "https://r.jina.ai/http://" + targetUrl.replace(/^https?:\/\//, "");
       try {
@@ -225,21 +236,18 @@ app.get("/api/price", async (req, res) => {
 
     const $ = cheerio.load(html);
     const meta = extractMeta($);
-    const extractor = extractors.find((ex) => ex.test(targetUrl)) || extractors.at(-1);
-    let { price, image } = extractor.run($);
-
-    // Falls Domain-Extractor kein Bild liefert, nimm OG
-    if (!image) image = meta.image;
+    const { price, image } = universalExtract($, targetUrl);
 
     if (!price) {
-      // heuristischer Body-Fallback
-      const m = $("body").text().match(/(\d{1,3}(\.\d{3})*|\d+),\d{2}\s*€/);
-      const num = parsePriceNumber(m?.[0] || "");
-      if (num) return res.json({ price: num, title: meta.title, image, via: "fallback" });
-      return res.status(404).json({ error: "Kein Preis gefunden", title: meta.title, image });
+      return res.status(404).json({ error: "Kein Preis gefunden", title: meta.title, image: image || meta.image });
     }
 
-    return res.json({ price, title: meta.title, image, via: "direct" });
+    return res.json({
+      price,
+      title: meta.title,
+      image: image || meta.image || null,
+      via: "universal",
+    });
   } catch (err) {
     console.error("Proxy-Fehler /api/price:", err.response?.statusCode, err.message, "URL:", req.query.url);
     return res.status(500).json({ error: "Interner Fehler beim Preisabruf" });
