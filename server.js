@@ -39,30 +39,24 @@ const parsePriceNumber = (str) => {
   // Whitespace weg, nur Ziffern/Punkt/Komma/Minus behalten
   const cleaned = String(str).replace(/\s+/g, "").replace(/[^\d,.\-]/g, "");
 
-  // Verschiedene internationalen Formate normalisieren:
-  // 1.299,99  -> 1299.99
-  // 1,299.99  -> 1299.99
-  // 1299,99   -> 1299.99
-  // 1299.99   -> 1299.99
+  // Internationale Formate normalisieren:
+  // 1.299,99 → 1299.99, 1,299.99 → 1299.99, 1299,99 → 1299.99, 1299.99 → 1299.99
   let normalized = cleaned;
 
   if (normalized.includes(",") && normalized.includes(".")) {
     const lastComma = normalized.lastIndexOf(",");
     const lastDot = normalized.lastIndexOf(".");
     if (lastComma > lastDot) {
-      // Komma ist Dezimaltrenner (DE)
       normalized = normalized.replace(/\.(?=\d{3}\b)/g, "").replace(",", ".");
     } else {
-      // Punkt ist Dezimaltrenner (US)
       normalized = normalized.replace(/,/g, "");
     }
   } else if (normalized.includes(",")) {
-    // Nur Komma vorhanden → entweder Dezimal- oder Tausendertrenner
     const parts = normalized.split(",");
     if (parts.length === 2 && parts[1].length <= 2) {
-      normalized = normalized.replace(",", "."); // Dezimal
+      normalized = normalized.replace(",", ".");
     } else {
-      normalized = normalized.replace(/,/g, ""); // Tausender
+      normalized = normalized.replace(/,/g, "");
     }
   }
 
@@ -209,34 +203,56 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // 5) Häufige CSS-Selektoren
+  // 5) Häufige CSS-Selektoren (priorisiere "current"/"sale"/"final")  [PATCH 1]
   if (!price) {
-    const priceSelectors = [
-      ".price",
-      ".product-price",
+    const currentFirst = [
+      ".price--current",
+      ".price__current",
+      ".price-current",
       ".current-price",
+      ".sales-price",
+      ".final-price",
+      ".priceToPay .a-offscreen", // Amazon aktueller Preis
+      ".a-price .a-offscreen",    // Amazon
+    ];
+    const genericLater = [
       ".sale-price",
       ".offer-price",
+      ".product-price",
+      ".price",
       "#price",
       "#priceblock_ourprice",
       "#priceblock_dealprice",
-      ".a-price .a-offscreen",
       ".a-price-whole",
       "span.a-price > span.a-offscreen",
-      '[data-a-color="price"]',
-      ".priceToPay .a-offscreen",
+      "[data-a-color='price']",
       "[class*='price'][class*='current']",
       "[class*='Price']",
     ];
-    for (const sel of priceSelectors) {
-      const el = $(sel).first();
-      if (!el.length) continue;
-      const n = parsePriceNumber(el.text());
-      if (n) { price = n; strategies.push(`css:${sel}`); break; }
+
+    const trySelectors = (sels) => {
+      for (const sel of sels) {
+        const el = $(sel).first();
+        if (!el.length) continue;
+        const txt = el.text();
+        // harte Ausschlüsse: UVP/alter Preis
+        if (/\b(uvp|statt|vorher|durchgestrichen|unverbindlich)\b/i.test(txt)) continue;
+        const n = parsePriceNumber(txt);
+        if (n) return { n, sel };
+      }
+      return null;
+    };
+
+    let found = trySelectors(currentFirst);
+    if (!found) found = trySelectors(genericLater);
+
+    if (found?.n) {
+      price = found.n;
+      strategies.push(`css:${found.sel}`);
     }
   }
 
-  // 6) Regex (letzter Fallback)
+  // 6) Regex (Fallback) – bessere Auswahl sichtbarer EUR-Beträge  [PATCH 2]
   if (!price) {
     const body = $("body").text();
     const patterns = [
@@ -244,19 +260,20 @@ const universalExtract = ($, pageUrl) => {
       /€\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/g,
       /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*EUR/gi,
       /EUR\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/gi,
-      /(\d+[.,]\d{2})\s*€/g,
     ];
-    const found = [];
+
+    const all = [];
     for (const re of patterns) {
       for (const m of body.matchAll(re)) {
         const n = parsePriceNumber(m[1]);
-        if (n && n > 0 && n < 1_000_000) found.push(n);
+        if (!n || n <= 0 || n > 1_000_000) continue;
+        all.push(n);
       }
     }
-    if (found.length) {
-      // häufigsten Wert nehmen (oder kleinsten bei Gleichstand)
+
+    if (all.length) {
       const freq = {};
-      for (const p of found) freq[p] = (freq[p] || 0) + 1;
+      for (const p of all) freq[p] = (freq[p] || 0) + 1;
       const sorted = Object.entries(freq).sort((a, b) =>
         b[1] === a[1] ? Number(a[0]) - Number(b[0]) : b[1] - a[1]
       );
@@ -265,7 +282,7 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // Bild-Fallbacks (grösstes plausibles Bild)
+  // Bild-Fallbacks
   if (!image) {
     const imageSelectors = [
       "#landingImage",
@@ -306,6 +323,23 @@ const universalExtract = ($, pageUrl) => {
     if (abs) { image = abs; strategies.push("img:largest"); }
   }
 
+  // 7) Reconciliation: Meta-Preis > sichtbarer Angebotspreis → nimm den niedrigeren plausiblen  [PATCH 3]
+  try {
+    const text = $("body").text();
+    const euroMatches = Array.from(
+      text.matchAll(/(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€/g)
+    )
+      .map((m) => parsePriceNumber(m[1]))
+      .filter(Boolean);
+    if (euroMatches.length) {
+      const minVisible = Math.min(...euroMatches);
+      if (price && minVisible < price && minVisible >= price * 0.5) {
+        price = minVisible;
+        strategies.push("reconcile:minVisible");
+      }
+    }
+  } catch {}
+
   return { price, image, strategies };
 };
 
@@ -314,7 +348,7 @@ const universalExtract = ($, pageUrl) => {
    ========================= */
 app.get("/api/price", async (req, res) => {
   let targetUrl = (req.query.url || "").trim();
-  const fresh = req.query.fresh === "1";
+  const freshQuery = req.query.fresh === "1";
 
   try {
     if (!targetUrl) {
@@ -326,6 +360,15 @@ app.get("/api/price", async (req, res) => {
     }
     try { new URL(targetUrl); } catch { return res.status(400).json({ error: "Ungültige URL." }); }
 
+    // OPTIONAL: Links von Preisvergleichen → standardmäßig "fresh"
+    let forceFresh = freshQuery;
+    try {
+      const u = new URL(targetUrl);
+      if (/(idealo|geizhals|billiger)/i.test(u.search)) {
+        forceFresh = true;
+      }
+    } catch {}
+
     log("\n=== Anfrage ===");
     log("URL:", targetUrl);
 
@@ -335,8 +378,8 @@ app.get("/api/price", async (req, res) => {
       accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
       "accept-language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
       "accept-encoding": "gzip, deflate, br",
-      "cache-control": fresh ? "no-cache" : "max-age=0",
-      pragma: fresh ? "no-cache" : "no-cache",
+      "cache-control": forceFresh ? "no-cache" : "max-age=0",
+      pragma: forceFresh ? "no-cache" : "no-cache",
       "sec-fetch-dest": "document",
       "sec-fetch-mode": "navigate",
       "sec-fetch-site": "none",
@@ -378,7 +421,7 @@ app.get("/api/price", async (req, res) => {
       }
     }
 
-    // 2) Reader-Fallback (liefert reinen Content)
+    // 2) Reader-Fallback
     if (!html) {
       const readerUrl = "https://r.jina.ai/http://" + targetUrl.replace(/^https?:\/\//, "");
       try {
@@ -430,7 +473,7 @@ app.get("/api/price", async (req, res) => {
 });
 
 /* =========================
-   /api/img  (Bild-Proxy)
+   /api/img  (Bild-Proxy mit Amazon-Referer-Härte)
    ========================= */
 app.get("/api/img", async (req, res) => {
   const target = req.query.url;
@@ -438,6 +481,25 @@ app.get("/api/img", async (req, res) => {
     return res.status(400).send("Bad image url");
   }
   try {
+    const u = new URL(target);
+    // Default-Referer: Origin der Ziel-URL
+    let referer = u.origin + "/";
+
+    // Amazon-CDNs härten
+    const host = u.hostname;
+    if (
+      /(^|\.)images-amazon\.com$/i.test(host) ||
+      /(^|\.)ssl-images-amazon\.com$/i.test(host) ||
+      /(^|\.)media-amazon\.com$/i.test(host) ||
+      /(^|\.)m\.media-amazon\.com$/i.test(host)
+    ) {
+      // grobe Landedomain raten
+      const guess = host.endsWith(".co.uk") ? "https://www.amazon.co.uk/"
+                  : host.endsWith(".com")    ? "https://www.amazon.com/"
+                  : "https://www.amazon.de/";
+      referer = guess;
+    }
+
     const r = await got(target, {
       responseType: "buffer",
       headers: {
@@ -445,7 +507,7 @@ app.get("/api/img", async (req, res) => {
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "accept-language": "de-DE,de;q=0.9,en;q=0.8",
-        referer: new URL(target).origin + "/",
+        referer,
         "cache-control": "no-cache",
         pragma: "no-cache",
       },
@@ -470,11 +532,11 @@ app.get("/api/img", async (req, res) => {
    Root & Health
    ========================= */
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OK - Universal Price Proxy v2.0");
+  res.type("text/plain").send("OK - Universal Price Proxy v2.1");
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", version: "2.0", debug: DEBUG });
+  res.json({ status: "ok", version: "2.1", debug: DEBUG });
 });
 
 /* =========================
