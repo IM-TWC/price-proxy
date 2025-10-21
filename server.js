@@ -36,7 +36,14 @@ const log = (...args) => {
 
 const parsePriceNumber = (str) => {
   if (!str && str !== 0) return null;
-  const cleaned = String(str).replace(/\s+/g, "").replace(/[^\d,.\-]/g, "");
+  let s = String(str);
+
+  // Fälle wie "379,-" → ersetze ,-
+  s = s.replace(/,-\b/g, ",00");
+
+  // Whitespace raus, nur Ziffern/.,- behalten
+  const cleaned = s.replace(/\s+/g, "").replace(/[^\d,.\-]/g, "");
+
   let normalized = cleaned;
   if (normalized.includes(",") && normalized.includes(".")) {
     const lastComma = normalized.lastIndexOf(",");
@@ -54,6 +61,7 @@ const parsePriceNumber = (str) => {
       normalized = normalized.replace(/,/g, "");
     }
   }
+
   const num = parseFloat(normalized);
   return Number.isFinite(num) && num > 0 ? num : null;
 };
@@ -67,6 +75,7 @@ const extractMeta = ($) => {
     null;
 
   const image =
+    $('meta[property="og:image:url"]').attr("content") ||
     $('meta[property="og:image"]').attr("content") ||
     $('meta[property="og:image:secure_url"]').attr("content") ||
     $('meta[name="twitter:image"]').attr("content") ||
@@ -86,33 +95,137 @@ const absolutize = (maybeUrl, base) => {
   }
 };
 
-/* ========= Preis-Kandidaten-Logik (NEU) ========= */
+/* ======= Bild-Utilities (verbessert) ======= */
+const pickFromSrcset = (srcset) => {
+  if (!srcset) return null;
+  // Beispiel: "img1.jpg 320w, img2.jpg 640w, img3.jpg 1280w"
+  const parts = srcset
+    .split(",")
+    .map((p) => p.trim())
+    .map((seg) => {
+      const m = seg.match(/(\S+)\s+(\d+)w/);
+      if (m) return { url: m[1], w: parseInt(m[2], 10) };
+      return { url: seg.split(" ")[0], w: 0 };
+    })
+    .filter((o) => o.url);
+  if (!parts.length) return null;
+  parts.sort((a, b) => b.w - a.w);
+  return parts[0].url;
+};
+
+const getImgCandidateFromEl = ($img, pageUrl) => {
+  if (!$img || !$img.length) return null;
+  const attrs = [
+    "src",
+    "data-src",
+    "data-original",
+    "data-large_image",
+    "data-zoom-image",
+    "data-lazy",
+    "content",
+  ];
+  for (const a of attrs) {
+    const v = $img.attr(a);
+    if (v) {
+      const abs = absolutize(v, pageUrl);
+      if (abs && !/sprite|icon|logo|placeholder|loading/i.test(abs)) return abs;
+    }
+  }
+  // srcset am <img>
+  const srcset = $img.attr("srcset") || $img.attr("data-srcset");
+  const best = pickFromSrcset(srcset);
+  const absBest = absolutize(best, pageUrl);
+  if (absBest && !/sprite|icon|logo|placeholder|loading/i.test(absBest)) return absBest;
+  return null;
+};
+
+const findBestImage = ($, pageUrl) => {
+  // 1) OG/Twitter
+  let image =
+    $('meta[property="og:image:url"]').attr("content") ||
+    $('meta[property="og:image"]').attr("content") ||
+    $('meta[property="og:image:secure_url"]').attr("content") ||
+    $('meta[name="twitter:image"]').attr("content") ||
+    null;
+  image = absolutize(image, pageUrl);
+  if (image) return image;
+
+  // 2) <picture><source srcset>
+  const picSrc = $("picture source").map((_, el) => $(el).attr("srcset")).get().find(Boolean);
+  const bestPic = absolutize(pickFromSrcset(picSrc), pageUrl);
+  if (bestPic) return bestPic;
+
+  // 3) <img> in gängigen Containern
+  const imgSelectors = [
+    "#landingImage",
+    "#imgBlkFront",
+    ".product-image img",
+    ".product-gallery img",
+    "#main-image",
+    "[data-testid='product-image']",
+    "[class*='ProductImage'] img",
+    "[class*='product-img'] img",
+    ".gallery-main img",
+    "[itemprop='image']",
+    "img[data-old-hires]",
+    "img", // zuletzt beliebiges img
+  ];
+
+  for (const sel of imgSelectors) {
+    const $img = $(sel).first();
+    const cand = getImgCandidateFromEl($img, pageUrl);
+    if (cand) return cand;
+  }
+
+  // 4) Link-Preloads
+  const preload = $('link[rel="preload"][as="image"]').attr("href");
+  const absPreload = absolutize(preload, pageUrl);
+  if (absPreload) return absPreload;
+
+  // 5) Fallback: größtes Bild (wenn width/height angegeben)
+  let best = null;
+  let maxArea = 0;
+  $("img").each((_, el) => {
+    const $img = $(el);
+    const src = getImgCandidateFromEl($img, pageUrl);
+    if (!src) return;
+    const w = parseInt($img.attr("width")) || 0;
+    const h = parseInt($img.attr("height")) || 0;
+    const area = w * h;
+    if (area > maxArea && area > 40000) {
+      maxArea = area;
+      best = src;
+    }
+  });
+  if (best) return best;
+
+  return null;
+};
+
+/* ========= Preis-Kandidaten-Logik ========= */
 const chooseBestPrice = (cands) => {
-  // harte Grenzen (unter 10€ idR Versand/mtl./Zubehör; >100k unrealistisch)
   const HARD_MIN = 10;
   const HARD_MAX = 100000;
 
   if (!cands.length) return null;
 
-  // Filter nach Bereich, wenn möglich
   const inRange = cands.filter((c) => c.value >= HARD_MIN && c.value <= HARD_MAX);
   const list = inRange.length ? inRange : cands;
 
-  // Frequenz (Modus)
   const freq = {};
   for (const c of list) {
     freq[c.value] = (freq[c.value] || 0) + 1;
   }
   const sorted = Object.entries(freq).sort((a, b) => {
     const fa = a[1], fb = b[1];
-    if (fb !== fa) return fb - fa;         // häufigster zuerst
-    return parseFloat(b[0]) - parseFloat(a[0]); // bei Gleichstand: größter
+    if (fb !== fa) return fb - fa;
+    return parseFloat(b[0]) - parseFloat(a[0]);
   });
   return parseFloat(sorted[0][0]);
 };
 
 /* =========================
-   JSON-Blobs aus <script>-Tags (SPA)
+   JSON-Blobs (SPA)
    ========================= */
 const collectFromJSON = (obj, acc) => {
   if (!obj || typeof obj !== "object") return;
@@ -161,7 +274,6 @@ const extractFromInlineJSON = ($, pageUrl, acc) => {
     try {
       parsed = JSON.parse(txt);
     } catch {
-      // Preisstrings direkt fischen
       const priceRegexes = [
         /"price"\s*:\s*"([^"]+)"/gi,
         /"currentPrice"\s*:\s*"([^"]+)"/gi,
@@ -188,7 +300,6 @@ const extractFromInlineJSON = ($, pageUrl, acc) => {
     } catch {}
   });
 
-  // Bilder absolut & filtern
   acc.images = acc.images
     .map((u) => absolutize(u, pageUrl))
     .filter(Boolean)
@@ -199,7 +310,7 @@ const extractFromInlineJSON = ($, pageUrl, acc) => {
    Universal Extractor (statisch)
    ========================= */
 const universalExtract = ($, pageUrl) => {
-  const priceCands = [];  // NEU: wir sammeln Kandidaten
+  const priceCands = [];
   let image = null;
   const strategies = [];
 
@@ -241,7 +352,7 @@ const universalExtract = ($, pageUrl) => {
           }
         }
       }
-      if (list.length) strategies.push("JSON-LD");
+      strategies.push("JSON-LD");
     } catch (err) {
       log("JSON-LD parse error:", err.message);
     }
@@ -252,28 +363,20 @@ const universalExtract = ($, pageUrl) => {
     const el = $('[itemprop="price"]').first();
     const val = el.attr("content") || el.text();
     push(parsePriceNumber(val), "microdata:price");
-    if (!image) {
-      const img = $('[itemprop="image"]').first();
-      const src = img.attr("src") || img.attr("content");
-      const abs = absolutize(src, pageUrl);
-      if (abs) { image = abs; strategies.push("microdata:image"); }
-    }
   }
 
-  // OG/Twitter
+  // OG/Twitter + Bild
   {
-    const og =
+    const ogPrice =
       $('meta[property="product:price:amount"]').attr("content") ||
       $('meta[property="og:price:amount"]').attr("content") ||
       $('meta[name="twitter:data1"]').attr("content") ||
       null;
-    push(parsePriceNumber(og), "og/twitter:price");
+    push(parsePriceNumber(ogPrice), "og/twitter:price");
+
     if (!image) {
-      const metaImg =
-        $('meta[property="og:image"]').attr("content") ||
-        $('meta[name="twitter:image"]').attr("content");
-      const abs = absolutize(metaImg, pageUrl);
-      if (abs) { image = abs; strategies.push("og/twitter:image"); }
+      image = findBestImage($, pageUrl);
+      if (image) strategies.push("image:auto");
     }
   }
 
@@ -295,12 +398,11 @@ const universalExtract = ($, pageUrl) => {
         el.attr("data-price-amount") ||
         el.attr("data-product-price") ||
         el.text();
-      const n = parsePriceNumber(val);
-      push(n, `data:${sel}`);
+      push(parsePriceNumber(val), `data:${sel}`);
     }
   }
 
-  // CSS (priorisiert „current/sale/final“)
+  // CSS
   {
     const currentFirst = [
       ".price--current", ".price__current", ".price-current",
@@ -321,15 +423,14 @@ const universalExtract = ($, pageUrl) => {
         if (!el.length) continue;
         const txt = el.text();
         if (/\b(uvp|statt|vorher|durchgestrichen|unverbindlich)\b/i.test(txt)) continue;
-        const n = parsePriceNumber(txt);
-        push(n, `css:${tag}:${sel}`);
+        push(parsePriceNumber(txt), `css:${tag}:${sel}`);
       }
     };
     trySelectors(currentFirst, "current");
     trySelectors(genericLater, "generic");
   }
 
-  // JSON-Blob-Extractor (SPAs)
+  // JSON-Blob
   {
     const acc = { priceCands: [], images: [] };
     extractFromInlineJSON($, pageUrl, acc);
@@ -350,59 +451,20 @@ const universalExtract = ($, pageUrl) => {
       /€\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/g,
       /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*EUR/gi,
       /EUR\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/gi,
+      /(\d{1,4})(?:,-)\b/g, // 379,- → 379,00
     ];
     for (const re of patterns) {
       for (const m of body.matchAll(re)) {
-        const n = parsePriceNumber(m[1]);
+        const raw = m[1]?.includes(",-") ? m[1].replace(",-", ",00") : m[1];
+        const n = parsePriceNumber(raw);
         if (!n || n <= 0 || n > 1_000_000) continue;
         priceCands.push({ value: n, source: "regex:body" });
       }
     }
   }
 
-  // Bild-Fallbacks
-  if (!image) {
-    const imageSelectors = [
-      "#landingImage", "#imgBlkFront",
-      ".product-image img", ".product-gallery img",
-      "#main-image", "[data-testid='product-image']",
-      "[class*='ProductImage']", "[class*='product-img']",
-      ".gallery-main img", "[itemprop='image']",
-      "img[data-old-hires]",
-    ];
-    for (const sel of imageSelectors) {
-      const img = $(sel).first();
-      const src = img.attr("src") || img.attr("data-src") || img.attr("data-lazy");
-      const abs = absolutize(src, pageUrl);
-      if (abs && !abs.includes("placeholder") && !abs.includes("loading")) {
-        image = abs;
-        strategies.push(`img:${sel}`);
-        break;
-      }
-    }
-  }
-  if (!image) {
-    let best = null, maxArea = 0;
-    $("img").each((_, el) => {
-      const src = $(el).attr("src") || $(el).attr("data-src");
-      if (!src) return;
-      if (src.includes("icon") || src.includes("logo") || src.includes("sprite")) return;
-      const w = parseInt($(el).attr("width")) || 0;
-      const h = parseInt($(el).attr("height")) || 0;
-      const area = w * h;
-      if (area > maxArea && area > 40000) { maxArea = area; best = src; }
-    });
-    const abs = absolutize(best, pageUrl);
-    if (abs) { image = abs; strategies.push("img:largest"); }
-  }
-
-  // === FINAL: Beste Zahl wählen (statt „minVisible“) ===
   const price = chooseBestPrice(priceCands);
-
-  if (DEBUG) {
-    strategies.push(`candidates:${priceCands.length}`);
-  }
-
+  if (DEBUG) strategies.push(`candidates:${priceCands.length}`);
   return { price, image, strategies, priceCands };
 };
 
@@ -412,7 +474,7 @@ const universalExtract = ($, pageUrl) => {
 let browserSingleton = null;
 async function getBrowser() {
   if (!browserSingleton) {
-    const { chromium } = await import("playwright"); // dynamic import
+    const { chromium } = await import("playwright");
     browserSingleton = await chromium.launch({
       args: ["--no-sandbox", "--disable-setuid-sandbox"],
     });
@@ -420,7 +482,7 @@ async function getBrowser() {
   return browserSingleton;
 }
 
-async function renderWithBrowser(targetUrl, timeoutMs = 20000) {
+async function renderWithBrowser(targetUrl, timeoutMs = 22000) {
   const browser = await getBrowser();
   const context = await browser.newContext({
     userAgent:
@@ -432,18 +494,19 @@ async function renderWithBrowser(targetUrl, timeoutMs = 20000) {
   try {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
 
-    // Cookiebanner grob quittieren
+    // Cookiebanner heuristisch schließen
     const acceptTexts = ["zustimmen", "akzeptieren", "alle akzeptieren", "accept all", "accept"];
     for (const text of acceptTexts) {
       const el = await page.$(`text=${text}`);
       if (el) {
-        try { await el.click({ timeout: 1000 }); } catch {}
+        try { await el.click({ timeout: 800 }); } catch {}
       }
     }
 
-    await page.waitForTimeout(1200);
-    const html = await page.content();
-    return html;
+    // kurz warten, bis Preise/Bilder im DOM landen
+    await page.waitForTimeout(1400);
+
+    return await page.content();
   } finally {
     await context.close();
   }
@@ -526,7 +589,7 @@ app.get("/api/price", async (req, res) => {
       }
     }
 
-    // 2) Reader-Fallback
+    // 2) Reader-Fallback (nur wenn gar nichts kam)
     if (!html) {
       used = "reader";
       const readerUrl = "https://r.jina.ai/http://" + targetUrl.replace(/^https?:\/\//, "");
@@ -542,26 +605,35 @@ app.get("/api/price", async (req, res) => {
       }
     }
 
-    // 3) Headless Render (falls erlaubt & nötig)
+    if (!html) {
+      return res.status(502).json({ error: "Seite konnte nicht geladen werden", url: targetUrl });
+    }
+
+    // Statische Extraktion
+    let $ = cheerio.load(html);
+    let meta = extractMeta($);
+    let out = universalExtract($, targetUrl);
+
+    // NEU: Wenn Preis ODER Bild fehlen, versuche Headless (falls erlaubt)
     let viaBrowser = false;
-    if ((forceRender || USE_BROWSER) && (!html || used === "reader")) {
-      viaBrowser = true;
+    if (
+      (forceRender || USE_BROWSER) &&
+      (!out.price || !out.image)
+    ) {
       try {
-        html = await renderWithBrowser(targetUrl, 20000);
+        const html2 = await renderWithBrowser(targetUrl, 22000);
+        viaBrowser = true;
         used = "browser";
-        log("✓ Headless-Render erfolgreich");
+        $ = cheerio.load(html2);
+        meta = extractMeta($);
+        out = universalExtract($, targetUrl);
+        log("✓ Browser-Fallback genutzt (missing:", !out.price ? "price" : "", !out.image ? "image" : "", ")");
       } catch (err3) {
         log("✗ Headless-Render fehlgeschlagen:", err3.message);
       }
     }
 
-    if (!html) {
-      return res.status(502).json({ error: "Seite konnte nicht geladen werden", url: targetUrl });
-    }
-
-    const $ = cheerio.load(html);
-    const meta = extractMeta($);
-    const { price, image, strategies, priceCands } = universalExtract($, targetUrl);
+    const { price, image, strategies, priceCands } = out;
 
     log("=== Ergebnis ===");
     log("Quelle:", used, viaBrowser ? "(rendered)" : "");
@@ -572,25 +644,6 @@ app.get("/api/price", async (req, res) => {
     log("Strategien:", strategies);
 
     if (!price) {
-      // Letzter Versuch: wenn Browser erlaubt & noch nicht genutzt
-      if (USE_BROWSER && !viaBrowser) {
-        try {
-          const html2 = await renderWithBrowser(targetUrl, 20000);
-          const $2 = cheerio.load(html2);
-          const meta2 = extractMeta($2);
-          const out2 = universalExtract($2, targetUrl);
-          if (out2.price) {
-            return res.json({
-              price: out2.price,
-              title: meta2.title,
-              image: out2.image || meta2.image || null,
-              strategies: DEBUG ? out2.strategies.concat(["final:browser"]) : undefined,
-              debug: DEBUG ? { candidates: out2.priceCands } : undefined,
-            });
-          }
-        } catch {}
-      }
-
       return res.status(404).json({
         error: "Kein Preis gefunden",
         title: meta.title,
@@ -669,11 +722,11 @@ app.get("/api/img", async (req, res) => {
    Root & Health
    ========================= */
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OK - Universal Price Proxy v3.1 (candidates+filter)");
+  res.type("text/plain").send("OK - Universal Price Proxy v3.2 (better images + browser fallback if missing)");
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", version: "3.1", debug: DEBUG, browser: USE_BROWSER });
+  res.json({ status: "ok", version: "3.2", debug: DEBUG, browser: USE_BROWSER });
 });
 
 /* =========================
