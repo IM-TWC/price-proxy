@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map((s) => s.trim());
-const DEBUG = process.env.DEBUG === "1"; // DEBUG=1 → ausführliche Logs
+const DEBUG = process.env.DEBUG === "1";
 
 app.use(
   cors({
@@ -34,15 +34,9 @@ const log = (...args) => {
 };
 
 const parsePriceNumber = (str) => {
-  if (!str) return null;
-
-  // Whitespace weg, nur Ziffern/Punkt/Komma/Minus behalten
+  if (!str && str !== 0) return null;
   const cleaned = String(str).replace(/\s+/g, "").replace(/[^\d,.\-]/g, "");
-
-  // Internationale Formate normalisieren:
-  // 1.299,99 → 1299.99, 1,299.99 → 1299.99, 1299,99 → 1299.99, 1299.99 → 1299.99
   let normalized = cleaned;
-
   if (normalized.includes(",") && normalized.includes(".")) {
     const lastComma = normalized.lastIndexOf(",");
     const lastDot = normalized.lastIndexOf(".");
@@ -59,7 +53,6 @@ const parsePriceNumber = (str) => {
       normalized = normalized.replace(/,/g, "");
     }
   }
-
   const num = parseFloat(normalized);
   return Number.isFinite(num) && num > 0 ? num : null;
 };
@@ -92,16 +85,137 @@ const absolutize = (maybeUrl, base) => {
   }
 };
 
+// JSON Utility: Tiefen-Suche nach Preisen/Bildern in beliebigen Objekten
+const collectFromJSON = (obj, acc) => {
+  if (!obj || typeof obj !== "object") return;
+
+  const priceKeys = [
+    "price",
+    "currentPrice",
+    "salesPrice",
+    "salePrice",
+    "finalPrice",
+    "priceValue",
+    "unitPrice",
+    "lowPrice",
+    "offerPrice",
+    "amount",
+    "value",
+  ];
+  const imageKeys = [
+    "image",
+    "imageUrl",
+    "imageURL",
+    "img",
+    "thumbnail",
+    "thumbnailUrl",
+    "primaryImage",
+    "mediaUrl",
+  ];
+
+  if (Array.isArray(obj)) {
+    for (const el of obj) collectFromJSON(el, acc);
+    return;
+  }
+
+  for (const [k, v] of Object.entries(obj)) {
+    const lk = k.toLowerCase();
+
+    // Preisfelder (string/number)
+    if (priceKeys.some((pk) => lk.includes(pk.toLowerCase()))) {
+      const n = parsePriceNumber(v);
+      if (n) acc.prices.push(n);
+    }
+
+    // Bildfelder
+    if (imageKeys.some((ik) => lk.includes(ik.toLowerCase()))) {
+      if (typeof v === "string") {
+        acc.images.push(v);
+      } else if (v && typeof v === "object") {
+        if (v.url) acc.images.push(v.url);
+        if (v.src) acc.images.push(v.src);
+      }
+    }
+
+    // Schachtelung
+    if (v && typeof v === "object") collectFromJSON(v, acc);
+  }
+};
+
+// Extractor für JSON-Blobs in <script>-Tags (Shop-SPAs wie otto.de, etc.)
+const extractFromInlineJSON = ($, pageUrl) => {
+  const acc = { prices: [], images: [] };
+
+  $('script:not([type]),script[type="application/json"],script[type*="ld+json"]').each((_, el) => {
+    const txt = $(el).text();
+    if (!txt || txt.length < 40) return;
+
+    // Versuche strukturiert zu parsen
+    let parsed = null;
+    try {
+      // Manchmal kommt mehrfaches JSON nacheinander; versuch das erste gültige
+      parsed = JSON.parse(txt);
+    } catch {
+      // Kein reines JSON → versuche Zahlen „price": "12,34" per Regex zu greifen
+      const priceRegexes = [
+        /"price"\s*:\s*"([^"]+)"/gi,
+        /"currentPrice"\s*:\s*"([^"]+)"/gi,
+        /"salesPrice"\s*:\s*"([^"]+)"/gi,
+        /"finalPrice"\s*:\s*"([^"]+)"/gi,
+        /"lowPrice"\s*:\s*"([^"]+)"/gi,
+        /"amount"\s*:\s*"([^"]+)"/gi,
+        /"value"\s*:\s*"([^"]+)"/gi,
+      ];
+      for (const re of priceRegexes) {
+        let m;
+        while ((m = re.exec(txt))) {
+          const n = parsePriceNumber(m[1]);
+          if (n) acc.prices.push(n);
+        }
+      }
+
+      // Bilder innerhalb von JSON-ähnlichem Text
+      const imgMatches = txt.match(/https?:\/\/[^\s"'\\)]+?\.(?:jpg|jpeg|png|webp)/gi);
+      if (imgMatches) acc.images.push(...imgMatches);
+      return;
+    }
+
+    // Tiefen-Suche
+    try {
+      collectFromJSON(parsed, acc);
+    } catch {}
+  });
+
+  // Post-Processing Bilder (absolut machen & filtern)
+  const imagesAbs = acc.images
+    .map((u) => absolutize(u, pageUrl))
+    .filter(Boolean)
+    .filter((u) => !/sprite|icon|logo|placeholder|loading/i.test(u));
+
+  // Preise: nimm den plausibel kleinsten (Angebot) oder den häufigsten
+  let price = null;
+  if (acc.prices.length) {
+    const freq = {};
+    acc.prices.forEach((p) => (freq[p] = (freq[p] || 0) + 1));
+    const sorted = Object.entries(freq).sort((a, b) =>
+      b[1] === a[1] ? Number(a[0]) - Number(b[0]) : b[1] - a[1]
+    );
+    price = parseFloat(sorted[0][0]);
+  }
+
+  const image = imagesAbs[0] || null;
+  return { price, image };
+};
+
 /* =========================
    Universal Extractor
-   (JSON-LD • Microdata • OG/Twitter • data-* • CSS • Regex)
    ========================= */
 const universalExtract = ($, pageUrl) => {
   let price = null;
   let image = null;
   const strategies = [];
 
-  // 1) JSON-LD (schema.org Product/Offer, inkl. @graph)
+  // 1) JSON-LD
   $('script[type="application/ld+json"]').each((_, el) => {
     if (price && image) return;
     try {
@@ -148,7 +262,7 @@ const universalExtract = ($, pageUrl) => {
     }
   });
 
-  // 2) Microdata / itemprop
+  // 2) Microdata
   if (!price) {
     const el = $('[itemprop="price"]').first();
     const val = el.attr("content") || el.text();
@@ -180,7 +294,7 @@ const universalExtract = ($, pageUrl) => {
     if (abs) { image = abs; strategies.push("og/twitter:image"); }
   }
 
-  // 4) data-* Attrs (häufig bei SPAs)
+  // 4) data-*
   if (!price) {
     const selectors = [
       "[data-price]",
@@ -203,7 +317,7 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // 5) Häufige CSS-Selektoren (priorisiere "current"/"sale"/"final")  [PATCH 1]
+  // 5) CSS (priorisiert „current/sale/final“)
   if (!price) {
     const currentFirst = [
       ".price--current",
@@ -212,8 +326,8 @@ const universalExtract = ($, pageUrl) => {
       ".current-price",
       ".sales-price",
       ".final-price",
-      ".priceToPay .a-offscreen", // Amazon aktueller Preis
-      ".a-price .a-offscreen",    // Amazon
+      ".priceToPay .a-offscreen",
+      ".a-price .a-offscreen",
     ];
     const genericLater = [
       ".sale-price",
@@ -229,30 +343,39 @@ const universalExtract = ($, pageUrl) => {
       "[class*='price'][class*='current']",
       "[class*='Price']",
     ];
-
     const trySelectors = (sels) => {
       for (const sel of sels) {
         const el = $(sel).first();
         if (!el.length) continue;
         const txt = el.text();
-        // harte Ausschlüsse: UVP/alter Preis
         if (/\b(uvp|statt|vorher|durchgestrichen|unverbindlich)\b/i.test(txt)) continue;
         const n = parsePriceNumber(txt);
         if (n) return { n, sel };
       }
       return null;
     };
-
     let found = trySelectors(currentFirst);
     if (!found) found = trySelectors(genericLater);
-
     if (found?.n) {
       price = found.n;
       strategies.push(`css:${found.sel}`);
     }
   }
 
-  // 6) Regex (Fallback) – bessere Auswahl sichtbarer EUR-Beträge  [PATCH 2]
+  // 5.5) JSON-Blob-Extractor (SPAs wie OTTO)  << NEU
+  if (!price || !image) {
+    const fromJSON = extractFromInlineJSON($, pageUrl);
+    if (!price && fromJSON.price) {
+      price = fromJSON.price;
+      strategies.push("jsonblob:price");
+    }
+    if (!image && fromJSON.image) {
+      image = fromJSON.image;
+      strategies.push("jsonblob:image");
+    }
+  }
+
+  // 6) Regex-Fallback
   if (!price) {
     const body = $("body").text();
     const patterns = [
@@ -261,7 +384,6 @@ const universalExtract = ($, pageUrl) => {
       /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*EUR/gi,
       /EUR\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/gi,
     ];
-
     const all = [];
     for (const re of patterns) {
       for (const m of body.matchAll(re)) {
@@ -270,7 +392,6 @@ const universalExtract = ($, pageUrl) => {
         all.push(n);
       }
     }
-
     if (all.length) {
       const freq = {};
       for (const p of all) freq[p] = (freq[p] || 0) + 1;
@@ -282,7 +403,7 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // Bild-Fallbacks
+  // Bilder-Fallbacks
   if (!image) {
     const imageSelectors = [
       "#landingImage",
@@ -323,7 +444,7 @@ const universalExtract = ($, pageUrl) => {
     if (abs) { image = abs; strategies.push("img:largest"); }
   }
 
-  // 7) Reconciliation: Meta-Preis > sichtbarer Angebotspreis → nimm den niedrigeren plausiblen  [PATCH 3]
+  // 7) Reconciliation (sichtbar niedrigerer Preis)
   try {
     const text = $("body").text();
     const euroMatches = Array.from(
@@ -360,13 +481,11 @@ app.get("/api/price", async (req, res) => {
     }
     try { new URL(targetUrl); } catch { return res.status(400).json({ error: "Ungültige URL." }); }
 
-    // OPTIONAL: Links von Preisvergleichen → standardmäßig "fresh"
+    // Option: Preisvergleich UTM -> fresh
     let forceFresh = freshQuery;
     try {
       const u = new URL(targetUrl);
-      if (/(idealo|geizhals|billiger)/i.test(u.search)) {
-        forceFresh = true;
-      }
+      if (/(idealo|geizhals|billiger)/i.test(u.search)) forceFresh = true;
     } catch {}
 
     log("\n=== Anfrage ===");
@@ -402,7 +521,6 @@ app.get("/api/price", async (req, res) => {
       log("✓ Direkt geladen. Status:", resp.statusCode, "Len:", resp.body?.length);
     } catch (err) {
       log("✗ Direkter Abruf fehlgeschlagen:", err.message, err.response?.statusCode);
-      // Sonderfall Amazon: kurzer Retry mit Referer/Cookie
       if (targetUrl.includes("amazon.")) {
         try {
           const resp2 = await got(targetUrl, {
@@ -482,10 +600,7 @@ app.get("/api/img", async (req, res) => {
   }
   try {
     const u = new URL(target);
-    // Default-Referer: Origin der Ziel-URL
     let referer = u.origin + "/";
-
-    // Amazon-CDNs härten
     const host = u.hostname;
     if (
       /(^|\.)images-amazon\.com$/i.test(host) ||
@@ -493,10 +608,9 @@ app.get("/api/img", async (req, res) => {
       /(^|\.)media-amazon\.com$/i.test(host) ||
       /(^|\.)m\.media-amazon\.com$/i.test(host)
     ) {
-      // grobe Landedomain raten
       const guess = host.endsWith(".co.uk") ? "https://www.amazon.co.uk/"
-                  : host.endsWith(".com")    ? "https://www.amazon.com/"
-                  : "https://www.amazon.de/";
+        : host.endsWith(".com") ? "https://www.amazon.com/"
+        : "https://www.amazon.de/";
       referer = guess;
     }
 
@@ -532,11 +646,11 @@ app.get("/api/img", async (req, res) => {
    Root & Health
    ========================= */
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OK - Universal Price Proxy v2.1");
+  res.type("text/plain").send("OK - Universal Price Proxy v2.2");
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", version: "2.1", debug: DEBUG });
+  res.json({ status: "ok", version: "2.2", debug: DEBUG });
 });
 
 /* =========================
