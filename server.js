@@ -86,7 +86,34 @@ const absolutize = (maybeUrl, base) => {
   }
 };
 
-// JSON-Blobs aus <script>-Tags (SPA) scannen
+/* ========= Preis-Kandidaten-Logik (NEU) ========= */
+const chooseBestPrice = (cands) => {
+  // harte Grenzen (unter 10€ idR Versand/mtl./Zubehör; >100k unrealistisch)
+  const HARD_MIN = 10;
+  const HARD_MAX = 100000;
+
+  if (!cands.length) return null;
+
+  // Filter nach Bereich, wenn möglich
+  const inRange = cands.filter((c) => c.value >= HARD_MIN && c.value <= HARD_MAX);
+  const list = inRange.length ? inRange : cands;
+
+  // Frequenz (Modus)
+  const freq = {};
+  for (const c of list) {
+    freq[c.value] = (freq[c.value] || 0) + 1;
+  }
+  const sorted = Object.entries(freq).sort((a, b) => {
+    const fa = a[1], fb = b[1];
+    if (fb !== fa) return fb - fa;         // häufigster zuerst
+    return parseFloat(b[0]) - parseFloat(a[0]); // bei Gleichstand: größter
+  });
+  return parseFloat(sorted[0][0]);
+};
+
+/* =========================
+   JSON-Blobs aus <script>-Tags (SPA)
+   ========================= */
 const collectFromJSON = (obj, acc) => {
   if (!obj || typeof obj !== "object") return;
 
@@ -110,7 +137,7 @@ const collectFromJSON = (obj, acc) => {
 
     if (priceKeys.some((pk) => lk.includes(pk.toLowerCase()))) {
       const n = parsePriceNumber(v);
-      if (n) acc.prices.push(n);
+      if (n) acc.priceCands.push({ value: n, source: `json:${k}` });
     }
 
     if (imageKeys.some((ik) => lk.includes(ik.toLowerCase()))) {
@@ -125,9 +152,7 @@ const collectFromJSON = (obj, acc) => {
   }
 };
 
-const extractFromInlineJSON = ($, pageUrl) => {
-  const acc = { prices: [], images: [] };
-
+const extractFromInlineJSON = ($, pageUrl, acc) => {
   $('script:not([type]),script[type="application/json"],script[type*="ld+json"]').each((_, el) => {
     const txt = $(el).text();
     if (!txt || txt.length < 40) return;
@@ -136,7 +161,7 @@ const extractFromInlineJSON = ($, pageUrl) => {
     try {
       parsed = JSON.parse(txt);
     } catch {
-      // Versuche Preisstrings direkt zu fischen
+      // Preisstrings direkt fischen
       const priceRegexes = [
         /"price"\s*:\s*"([^"]+)"/gi,
         /"currentPrice"\s*:\s*"([^"]+)"/gi,
@@ -150,7 +175,7 @@ const extractFromInlineJSON = ($, pageUrl) => {
         let m;
         while ((m = re.exec(txt))) {
           const n = parsePriceNumber(m[1]);
-          if (n) acc.prices.push(n);
+          if (n) acc.priceCands.push({ value: n, source: "jsonblob:regex" });
         }
       }
       const imgMatches = txt.match(/https?:\/\/[^\s"'\\)]+?\.(?:jpg|jpeg|png|webp)/gi);
@@ -163,36 +188,29 @@ const extractFromInlineJSON = ($, pageUrl) => {
     } catch {}
   });
 
-  const imagesAbs = acc.images
+  // Bilder absolut & filtern
+  acc.images = acc.images
     .map((u) => absolutize(u, pageUrl))
     .filter(Boolean)
     .filter((u) => !/sprite|icon|logo|placeholder|loading/i.test(u));
-
-  let price = null;
-  if (acc.prices.length) {
-    const freq = {};
-    acc.prices.forEach((p) => (freq[p] = (freq[p] || 0) + 1));
-    const sorted = Object.entries(freq).sort((a, b) =>
-      b[1] === a[1] ? Number(a[0]) - Number(b[0]) : b[1] - a[1]
-    );
-    price = parseFloat(sorted[0][0]);
-  }
-
-  const image = imagesAbs[0] || null;
-  return { price, image };
 };
 
 /* =========================
    Universal Extractor (statisch)
    ========================= */
 const universalExtract = ($, pageUrl) => {
-  let price = null;
+  const priceCands = [];  // NEU: wir sammeln Kandidaten
   let image = null;
   const strategies = [];
 
+  const push = (n, source) => {
+    if (typeof n === "number" && Number.isFinite(n) && n > 0) {
+      priceCands.push({ value: n, source });
+    }
+  };
+
   // JSON-LD
   $('script[type="application/ld+json"]').each((_, el) => {
-    if (price && image) return;
     try {
       const raw = $(el).text();
       if (!raw) return;
@@ -209,19 +227,10 @@ const universalExtract = ($, pageUrl) => {
             const offerList = Array.isArray(offers) ? offers : [offers];
 
             for (const offer of offerList) {
-              if (!price && offer?.price) {
-                const n = parsePriceNumber(offer.price);
-                if (n) { price = n; strategies.push("JSON-LD:offers.price"); }
-              }
-              if (!price && offer?.lowPrice) {
-                const n = parsePriceNumber(offer.lowPrice);
-                if (n) { price = n; strategies.push("JSON-LD:offers.lowPrice"); }
-              }
+              if (offer?.price) push(parsePriceNumber(offer.price), "jsonld:offers.price");
+              if (offer?.lowPrice) push(parsePriceNumber(offer.lowPrice), "jsonld:offers.lowPrice");
             }
-            if (!price && node?.price) {
-              const n = parsePriceNumber(node.price);
-              if (n) { price = n; strategies.push("JSON-LD:price"); }
-            }
+            if (node?.price) push(parsePriceNumber(node.price), "jsonld:price");
 
             if (!image) {
               const imgCand = Array.isArray(node.image) ? node.image[0] : node.image;
@@ -232,45 +241,44 @@ const universalExtract = ($, pageUrl) => {
           }
         }
       }
+      if (list.length) strategies.push("JSON-LD");
     } catch (err) {
       log("JSON-LD parse error:", err.message);
     }
   });
 
   // Microdata
-  if (!price) {
+  {
     const el = $('[itemprop="price"]').first();
     const val = el.attr("content") || el.text();
-    const n = parsePriceNumber(val);
-    if (n) { price = n; strategies.push("microdata:price"); }
-  }
-  if (!image) {
-    const img = $('[itemprop="image"]').first();
-    const src = img.attr("src") || img.attr("content");
-    const abs = absolutize(src, pageUrl);
-    if (abs) { image = abs; strategies.push("microdata:image"); }
+    push(parsePriceNumber(val), "microdata:price");
+    if (!image) {
+      const img = $('[itemprop="image"]').first();
+      const src = img.attr("src") || img.attr("content");
+      const abs = absolutize(src, pageUrl);
+      if (abs) { image = abs; strategies.push("microdata:image"); }
+    }
   }
 
   // OG/Twitter
-  if (!price) {
+  {
     const og =
       $('meta[property="product:price:amount"]').attr("content") ||
       $('meta[property="og:price:amount"]').attr("content") ||
       $('meta[name="twitter:data1"]').attr("content") ||
       null;
-    const n = parsePriceNumber(og);
-    if (n) { price = n; strategies.push("og/twitter:price"); }
-  }
-  if (!image) {
-    const metaImg =
-      $('meta[property="og:image"]').attr("content") ||
-      $('meta[name="twitter:image"]').attr("content");
-    const abs = absolutize(metaImg, pageUrl);
-    if (abs) { image = abs; strategies.push("og/twitter:image"); }
+    push(parsePriceNumber(og), "og/twitter:price");
+    if (!image) {
+      const metaImg =
+        $('meta[property="og:image"]').attr("content") ||
+        $('meta[name="twitter:image"]').attr("content");
+      const abs = absolutize(metaImg, pageUrl);
+      if (abs) { image = abs; strategies.push("og/twitter:image"); }
+    }
   }
 
   // data-*
-  if (!price) {
+  {
     const selectors = [
       "[data-price]",
       "[data-price-amount]",
@@ -288,12 +296,12 @@ const universalExtract = ($, pageUrl) => {
         el.attr("data-product-price") ||
         el.text();
       const n = parsePriceNumber(val);
-      if (n) { price = n; strategies.push(`data-attr:${sel}`); break; }
+      push(n, `data:${sel}`);
     }
   }
 
   // CSS (priorisiert „current/sale/final“)
-  if (!price) {
+  {
     const currentFirst = [
       ".price--current", ".price__current", ".price-current",
       ".current-price", ".sales-price", ".final-price",
@@ -307,40 +315,35 @@ const universalExtract = ($, pageUrl) => {
       "[class*='price'][class*='current']",
       "[class*='Price']",
     ];
-    const trySelectors = (sels) => {
+    const trySelectors = (sels, tag) => {
       for (const sel of sels) {
         const el = $(sel).first();
         if (!el.length) continue;
         const txt = el.text();
         if (/\b(uvp|statt|vorher|durchgestrichen|unverbindlich)\b/i.test(txt)) continue;
         const n = parsePriceNumber(txt);
-        if (n) return { n, sel };
+        push(n, `css:${tag}:${sel}`);
       }
-      return null;
     };
-    let found = trySelectors(currentFirst);
-    if (!found) found = trySelectors(genericLater);
-    if (found?.n) {
-      price = found.n;
-      strategies.push(`css:${found.sel}`);
-    }
+    trySelectors(currentFirst, "current");
+    trySelectors(genericLater, "generic");
   }
 
   // JSON-Blob-Extractor (SPAs)
-  if (!price || !image) {
-    const fromJSON = extractFromInlineJSON($, pageUrl);
-    if (!price && fromJSON.price) {
-      price = fromJSON.price;
-      strategies.push("jsonblob:price");
-    }
-    if (!image && fromJSON.image) {
-      image = fromJSON.image;
+  {
+    const acc = { priceCands: [], images: [] };
+    extractFromInlineJSON($, pageUrl, acc);
+    for (const c of acc.priceCands) priceCands.push(c);
+    if (!image && acc.images.length) {
+      image = acc.images[0];
       strategies.push("jsonblob:image");
+    } else if (acc.images.length) {
+      strategies.push("jsonblob:image:candidate");
     }
   }
 
-  // Regex-Fallback
-  if (!price) {
+  // Regex-Fallback (Body)
+  {
     const body = $("body").text();
     const patterns = [
       /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€/g,
@@ -348,22 +351,12 @@ const universalExtract = ($, pageUrl) => {
       /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*EUR/gi,
       /EUR\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/gi,
     ];
-    const all = [];
     for (const re of patterns) {
       for (const m of body.matchAll(re)) {
         const n = parsePriceNumber(m[1]);
         if (!n || n <= 0 || n > 1_000_000) continue;
-        all.push(n);
+        priceCands.push({ value: n, source: "regex:body" });
       }
-    }
-    if (all.length) {
-      const freq = {};
-      for (const p of all) freq[p] = (freq[p] || 0) + 1;
-      const sorted = Object.entries(freq).sort((a, b) =>
-        b[1] === a[1] ? Number(a[0]) - Number(b[0]) : b[1] - a[1]
-      );
-      price = parseFloat(sorted[0][0]);
-      strategies.push("regex:body");
     }
   }
 
@@ -403,22 +396,14 @@ const universalExtract = ($, pageUrl) => {
     if (abs) { image = abs; strategies.push("img:largest"); }
   }
 
-  // Reconciliation: nimm plausibel sichtbaren Minimalpreis
-  try {
-    const text = $("body").text();
-    const euroMatches = Array.from(
-      text.matchAll(/(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€/g)
-    ).map((m) => parsePriceNumber(m[1])).filter(Boolean);
-    if (euroMatches.length) {
-      const minVisible = Math.min(...euroMatches);
-      if (price && minVisible < price && minVisible >= price * 0.5) {
-        price = minVisible;
-        strategies.push("reconcile:minVisible");
-      }
-    }
-  } catch {}
+  // === FINAL: Beste Zahl wählen (statt „minVisible“) ===
+  const price = chooseBestPrice(priceCands);
 
-  return { price, image, strategies };
+  if (DEBUG) {
+    strategies.push(`candidates:${priceCands.length}`);
+  }
+
+  return { price, image, strategies, priceCands };
 };
 
 /* =========================
@@ -435,7 +420,7 @@ async function getBrowser() {
   return browserSingleton;
 }
 
-async function renderWithBrowser(targetUrl, timeoutMs = 15000) {
+async function renderWithBrowser(targetUrl, timeoutMs = 20000) {
   const browser = await getBrowser();
   const context = await browser.newContext({
     userAgent:
@@ -447,7 +432,7 @@ async function renderWithBrowser(targetUrl, timeoutMs = 15000) {
   try {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
 
-    // Cookie-Banner heuristisch „akzeptieren“
+    // Cookiebanner grob quittieren
     const acceptTexts = ["zustimmen", "akzeptieren", "alle akzeptieren", "accept all", "accept"];
     for (const text of acceptTexts) {
       const el = await page.$(`text=${text}`);
@@ -456,10 +441,7 @@ async function renderWithBrowser(targetUrl, timeoutMs = 15000) {
       }
     }
 
-    // warte kurz auf Preise/Bilder
     await page.waitForTimeout(1200);
-
-    // Versuch: JSON-LD & DOM nachladen
     const html = await page.content();
     return html;
   } finally {
@@ -473,7 +455,7 @@ async function renderWithBrowser(targetUrl, timeoutMs = 15000) {
 app.get("/api/price", async (req, res) => {
   let targetUrl = (req.query.url || "").trim();
   const freshQuery = req.query.fresh === "1";
-  const forceRender = req.query.render === "1"; // manuell rendern
+  const forceRender = req.query.render === "1";
 
   try {
     if (!targetUrl) {
@@ -512,7 +494,7 @@ app.get("/api/price", async (req, res) => {
     let html = null;
     let used = "direct";
 
-    // 1) Direkt laden
+    // 1) Direkt
     try {
       const resp = await got(targetUrl, {
         headers,
@@ -579,17 +561,18 @@ app.get("/api/price", async (req, res) => {
 
     const $ = cheerio.load(html);
     const meta = extractMeta($);
-    const { price, image, strategies } = universalExtract($, targetUrl);
+    const { price, image, strategies, priceCands } = universalExtract($, targetUrl);
 
     log("=== Ergebnis ===");
     log("Quelle:", used, viaBrowser ? "(rendered)" : "");
     log("Preis:", price);
     log("Titel:", meta.title);
     log("Bild:", image || meta.image);
+    if (DEBUG) log("Kandidaten:", priceCands);
     log("Strategien:", strategies);
 
     if (!price) {
-      // Wenn Browser erlaubt & noch nicht verwendet → letzter Versuch
+      // Letzter Versuch: wenn Browser erlaubt & noch nicht genutzt
       if (USE_BROWSER && !viaBrowser) {
         try {
           const html2 = await renderWithBrowser(targetUrl, 20000);
@@ -602,6 +585,7 @@ app.get("/api/price", async (req, res) => {
               title: meta2.title,
               image: out2.image || meta2.image || null,
               strategies: DEBUG ? out2.strategies.concat(["final:browser"]) : undefined,
+              debug: DEBUG ? { candidates: out2.priceCands } : undefined,
             });
           }
         } catch {}
@@ -611,7 +595,7 @@ app.get("/api/price", async (req, res) => {
         error: "Kein Preis gefunden",
         title: meta.title,
         image: image || meta.image || null,
-        debug: DEBUG ? { strategies, source: used } : undefined,
+        debug: DEBUG ? { strategies, source: used, candidates: priceCands } : undefined,
       });
     }
 
@@ -620,6 +604,7 @@ app.get("/api/price", async (req, res) => {
       title: meta.title,
       image: image || meta.image || null,
       strategies: DEBUG ? strategies.concat([`source:${used}`]) : undefined,
+      debug: DEBUG ? { candidates: priceCands } : undefined,
     });
   } catch (err) {
     console.error("Proxy-Fehler /api/price:", err.message);
@@ -684,11 +669,11 @@ app.get("/api/img", async (req, res) => {
    Root & Health
    ========================= */
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OK - Universal Price Proxy v3 (static+browser)");
+  res.type("text/plain").send("OK - Universal Price Proxy v3.1 (candidates+filter)");
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", version: "3.0", debug: DEBUG, browser: USE_BROWSER });
+  res.json({ status: "ok", version: "3.1", debug: DEBUG, browser: USE_BROWSER });
 });
 
 /* =========================
