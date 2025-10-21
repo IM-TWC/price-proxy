@@ -263,6 +263,10 @@ const universalExtract = ($, pageUrl) => {
       '#priceblock_ourprice',
       '#priceblock_dealprice',
       '.a-price .a-offscreen', // Amazon
+      '.a-price-whole', // Amazon
+      'span.a-price > span.a-offscreen', // Amazon spezifisch
+      '[data-a-color="price"]', // Amazon
+      '.priceToPay .a-offscreen', // Amazon neueres Format
       '[class*="price"][class*="current"]',
       '[class*="Price"]'
     ];
@@ -321,6 +325,8 @@ const universalExtract = ($, pageUrl) => {
   if (!image) {
     // Versuche spezifische Produkt-Bild-Container
     const imageSelectors = [
+      '#landingImage', // Amazon Hauptbild
+      '#imgBlkFront', // Amazon alternativ
       '.product-image img',
       '.product-gallery img',
       '#main-image',
@@ -328,7 +334,8 @@ const universalExtract = ($, pageUrl) => {
       '[class*="ProductImage"]',
       '[class*="product-img"]',
       '.gallery-main img',
-      '[itemprop="image"]'
+      '[itemprop="image"]',
+      'img[data-old-hires]', // Amazon hochauflösend
     ];
     
     for (const sel of imageSelectors) {
@@ -384,12 +391,26 @@ const universalExtract = ($, pageUrl) => {
 
 // ---------- Preis aus Direktlink ----------
 app.get("/api/price", async (req, res) => {
-  const targetUrl = req.query.url;
+  let targetUrl = req.query.url;
   const fresh = req.query.fresh === "1";
   
   try {
-    if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
-      return res.status(400).json({ error: "Parameter 'url' fehlt oder ist ungültig." });
+    if (!targetUrl) {
+      return res.status(400).json({ error: "Parameter 'url' fehlt." });
+    }
+    
+    // Auto-Korrektur: https:// hinzufügen wenn fehlt
+    targetUrl = targetUrl.trim();
+    if (!/^https?:\/\//i.test(targetUrl)) {
+      targetUrl = 'https://' + targetUrl;
+      log("URL korrigiert zu:", targetUrl);
+    }
+    
+    // Validierung nach Korrektur
+    try {
+      new URL(targetUrl); // Wirft Error wenn ungültig
+    } catch {
+      return res.status(400).json({ error: "Ungültige URL-Format." });
     }
 
     log("\n=== Neue Anfrage ===");
@@ -398,10 +419,15 @@ app.get("/api/price", async (req, res) => {
     const headers = {
       "user-agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "accept-language": "de-DE,de;q=0.9,en;q=0.8",
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "accept-language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+      "accept-encoding": "gzip, deflate, br",
       "cache-control": fresh ? "no-cache" : "max-age=0",
       pragma: fresh ? "no-cache" : "no-cache",
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-site": "none",
+      "upgrade-insecure-requests": "1",
     };
 
     let html = null;
