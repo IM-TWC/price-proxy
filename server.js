@@ -37,13 +37,8 @@ const log = (...args) => {
 const parsePriceNumber = (str) => {
   if (!str && str !== 0) return null;
   let s = String(str);
-
-  // Fälle wie "379,-" → ersetze ,-
-  s = s.replace(/,-\b/g, ",00");
-
-  // Whitespace raus, nur Ziffern/.,- behalten
+  s = s.replace(/,-\b/g, ",00"); // 379,- → 379,00
   const cleaned = s.replace(/\s+/g, "").replace(/[^\d,.\-]/g, "");
-
   let normalized = cleaned;
   if (normalized.includes(",") && normalized.includes(".")) {
     const lastComma = normalized.lastIndexOf(",");
@@ -61,7 +56,6 @@ const parsePriceNumber = (str) => {
       normalized = normalized.replace(/,/g, "");
     }
   }
-
   const num = parseFloat(normalized);
   return Number.isFinite(num) && num > 0 ? num : null;
 };
@@ -91,14 +85,17 @@ const absolutize = (maybeUrl, base) => {
     const absolute = new URL(maybeUrl, base).toString();
     return absolute.startsWith("http") ? absolute : null;
   } catch {
+    // Protokoll-relative URLs //cdn...
+    if (typeof maybeUrl === "string" && maybeUrl.startsWith("//")) {
+      return "https:" + maybeUrl;
+    }
     return null;
   }
 };
 
-/* ======= Bild-Utilities (verbessert) ======= */
+/* ======= Bild-Utilities ======= */
 const pickFromSrcset = (srcset) => {
   if (!srcset) return null;
-  // Beispiel: "img1.jpg 320w, img2.jpg 640w, img3.jpg 1280w"
   const parts = srcset
     .split(",")
     .map((p) => p.trim())
@@ -140,7 +137,6 @@ const getImgCandidateFromEl = ($img, pageUrl) => {
 };
 
 const findBestImage = ($, pageUrl) => {
-  // 1) OG/Twitter
   let image =
     $('meta[property="og:image:url"]').attr("content") ||
     $('meta[property="og:image"]').attr("content") ||
@@ -150,12 +146,10 @@ const findBestImage = ($, pageUrl) => {
   image = absolutize(image, pageUrl);
   if (image) return image;
 
-  // 2) <picture><source srcset>
   const picSrc = $("picture source").map((_, el) => $(el).attr("srcset")).get().find(Boolean);
   const bestPic = absolutize(pickFromSrcset(picSrc), pageUrl);
   if (bestPic) return bestPic;
 
-  // 3) <img> in gängigen Containern
   const imgSelectors = [
     "#landingImage",
     "#imgBlkFront",
@@ -168,7 +162,7 @@ const findBestImage = ($, pageUrl) => {
     ".gallery-main img",
     "[itemprop='image']",
     "img[data-old-hires]",
-    "img", // zuletzt beliebiges img
+    "img",
   ];
 
   for (const sel of imgSelectors) {
@@ -177,14 +171,11 @@ const findBestImage = ($, pageUrl) => {
     if (cand) return cand;
   }
 
-  // 4) Link-Preloads
   const preload = $('link[rel="preload"][as="image"]').attr("href");
   const absPreload = absolutize(preload, pageUrl);
   if (absPreload) return absPreload;
 
-  // 5) Fallback: größtes Bild (wenn width/height angegeben)
-  let best = null;
-  let maxArea = 0;
+  let best = null, maxArea = 0;
   $("img").each((_, el) => {
     const $img = $(el);
     const src = getImgCandidateFromEl($img, pageUrl);
@@ -202,26 +193,56 @@ const findBestImage = ($, pageUrl) => {
   return null;
 };
 
-/* ========= Preis-Kandidaten-Logik ========= */
+/* ========= VAT-aware Preiswahl ========= */
+const VAT_POSITIVE = [
+  "inkl. mwst", "inkl mwst", "inkl. steuer", "inkl steuer",
+  "inklusive mwst", "inklusive steuer",
+  "brutto", "vat included", "incl. vat", "ttc" // TTC (FR)
+];
+
+const VAT_NEGATIVE = [
+  "exkl. mwst", "exkl mwst", "exkl. steuer", "exkl steuer",
+  "ohne mwst", "ohne steuer",
+  "netto", "ex vat", "ht" // HT (FR)
+];
+
 const chooseBestPrice = (cands) => {
   const HARD_MIN = 10;
   const HARD_MAX = 100000;
 
   if (!cands.length) return null;
 
+  // Bereichsfilter
   const inRange = cands.filter((c) => c.value >= HARD_MIN && c.value <= HARD_MAX);
   const list = inRange.length ? inRange : cands;
 
+  // VAT-Scoring
+  const scored = list.map((c) => {
+    let score = 0;
+    const ctx = (c.context || "").toLowerCase();
+
+    if (VAT_POSITIVE.some((k) => ctx.includes(k))) score += 3;
+    if (VAT_NEGATIVE.some((k) => ctx.includes(k))) score -= 4;
+
+    return { ...c, score };
+  });
+
+  // Wenn es Kandidaten ohne Netto-Flag (score >= 0) gibt → bevorzuge diese Gruppe
+  const nonNetto = scored.filter((c) => c.score >= 0);
+  const pool = nonNetto.length ? nonNetto : scored;
+
+  // Modus in der gewählten Gruppe (nach Wert, unabhängig vom Score)
   const freq = {};
-  for (const c of list) {
+  for (const c of pool) {
     freq[c.value] = (freq[c.value] || 0) + 1;
   }
-  const sorted = Object.entries(freq).sort((a, b) => {
+  const sortedByMode = Object.entries(freq).sort((a, b) => {
     const fa = a[1], fb = b[1];
-    if (fb !== fa) return fb - fa;
-    return parseFloat(b[0]) - parseFloat(a[0]);
+    if (fb !== fa) return fb - fa;           // häufigster zuerst
+    return parseFloat(b[0]) - parseFloat(a[0]); // bei Gleichstand: größter
   });
-  return parseFloat(sorted[0][0]);
+
+  return parseFloat(sortedByMode[0][0]);
 };
 
 /* =========================
@@ -250,7 +271,7 @@ const collectFromJSON = (obj, acc) => {
 
     if (priceKeys.some((pk) => lk.includes(pk.toLowerCase()))) {
       const n = parsePriceNumber(v);
-      if (n) acc.priceCands.push({ value: n, source: `json:${k}` });
+      if (n) acc.priceCands.push({ value: n, source: `json:${k}`, context: "" });
     }
 
     if (imageKeys.some((ik) => lk.includes(ik.toLowerCase()))) {
@@ -287,7 +308,7 @@ const extractFromInlineJSON = ($, pageUrl, acc) => {
         let m;
         while ((m = re.exec(txt))) {
           const n = parsePriceNumber(m[1]);
-          if (n) acc.priceCands.push({ value: n, source: "jsonblob:regex" });
+          if (n) acc.priceCands.push({ value: n, source: "jsonblob:regex", context: "" });
         }
       }
       const imgMatches = txt.match(/https?:\/\/[^\s"'\\)]+?\.(?:jpg|jpeg|png|webp)/gi);
@@ -314,9 +335,9 @@ const universalExtract = ($, pageUrl) => {
   let image = null;
   const strategies = [];
 
-  const push = (n, source) => {
+  const push = (n, source, context = "") => {
     if (typeof n === "number" && Number.isFinite(n) && n > 0) {
-      priceCands.push({ value: n, source });
+      priceCands.push({ value: n, source, context });
     }
   };
 
@@ -443,7 +464,7 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // Regex-Fallback (Body)
+  // Regex-Fallback (Body) mit Kontext & VAT-Flagging
   {
     const body = $("body").text();
     const patterns = [
@@ -454,11 +475,14 @@ const universalExtract = ($, pageUrl) => {
       /(\d{1,4})(?:,-)\b/g, // 379,- → 379,00
     ];
     for (const re of patterns) {
-      for (const m of body.matchAll(re)) {
+      let m;
+      while ((m = re.exec(body))) {
+        const idx = m.index;
+        const ctx = body.slice(Math.max(0, idx - 60), Math.min(body.length, idx + 60)); // ±60 Zeichen
         const raw = m[1]?.includes(",-") ? m[1].replace(",-", ",00") : m[1];
         const n = parsePriceNumber(raw);
         if (!n || n <= 0 || n > 1_000_000) continue;
-        priceCands.push({ value: n, source: "regex:body" });
+        push(n, "regex:body", ctx);
       }
     }
   }
@@ -493,19 +517,12 @@ async function renderWithBrowser(targetUrl, timeoutMs = 22000) {
   const page = await context.newPage();
   try {
     await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
-
-    // Cookiebanner heuristisch schließen
     const acceptTexts = ["zustimmen", "akzeptieren", "alle akzeptieren", "accept all", "accept"];
     for (const text of acceptTexts) {
       const el = await page.$(`text=${text}`);
-      if (el) {
-        try { await el.click({ timeout: 800 }); } catch {}
-      }
+      if (el) { try { await el.click({ timeout: 800 }); } catch {} }
     }
-
-    // kurz warten, bis Preise/Bilder im DOM landen
     await page.waitForTimeout(1400);
-
     return await page.content();
   } finally {
     await context.close();
@@ -521,16 +538,13 @@ app.get("/api/price", async (req, res) => {
   const forceRender = req.query.render === "1";
 
   try {
-    if (!targetUrl) {
-      return res.status(400).json({ error: "Parameter 'url' fehlt." });
-    }
+    if (!targetUrl) return res.status(400).json({ error: "Parameter 'url' fehlt." });
     if (!/^https?:\/\//i.test(targetUrl)) {
       targetUrl = "https://" + targetUrl;
       log("URL korrigiert:", targetUrl);
     }
     try { new URL(targetUrl); } catch { return res.status(400).json({ error: "Ungültige URL." }); }
 
-    // Preisvergleich-UTMs → fresh
     let forceFresh = freshQuery;
     try {
       const u = new URL(targetUrl);
@@ -614,12 +628,9 @@ app.get("/api/price", async (req, res) => {
     let meta = extractMeta($);
     let out = universalExtract($, targetUrl);
 
-    // NEU: Wenn Preis ODER Bild fehlen, versuche Headless (falls erlaubt)
+    // WICHTIG: Wenn Preis ODER Bild fehlen → Headless-Fallback (falls erlaubt)
     let viaBrowser = false;
-    if (
-      (forceRender || USE_BROWSER) &&
-      (!out.price || !out.image)
-    ) {
+    if ((forceRender || USE_BROWSER) && (!out.price || !out.image)) {
       try {
         const html2 = await renderWithBrowser(targetUrl, 22000);
         viaBrowser = true;
@@ -722,11 +733,11 @@ app.get("/api/img", async (req, res) => {
    Root & Health
    ========================= */
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OK - Universal Price Proxy v3.2 (better images + browser fallback if missing)");
+  res.type("text/plain").send("OK - Universal Price Proxy v3.3 (VAT-aware + image fixes)");
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", version: "3.2", debug: DEBUG, browser: USE_BROWSER });
+  res.json({ status: "ok", version: "3.3", debug: DEBUG, browser: USE_BROWSER });
 });
 
 /* =========================
