@@ -573,7 +573,7 @@ app.get("/api/price", async (req, res) => {
         error: "Kein Preis gefunden",
         title: meta.title,
         image: image || meta.image || null,
-        debug: DEBUG ? { strategies } : undefined,
+        debug: DEBUG 1 { strategies } : undefined,
       });
     }
 
