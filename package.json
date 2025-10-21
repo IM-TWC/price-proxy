@@ -2,12 +2,15 @@
   "name": "price-proxy",
   "version": "1.0.0",
   "type": "module",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "cheerio": "^1.0.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "got": "^14.4.1",
-    "qs": "^6.12.1"
+    "qs": "^6.12.1",
+    "playwright": "^1.48.0"
   }
 }
