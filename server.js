@@ -444,20 +444,52 @@ app.get("/api/price", async (req, res) => {
       });
       html = response.body;
       log("✓ Seite erfolgreich geladen (direkt)");
+      log("Response status:", response.statusCode);
+      log("Content-Length:", response.body?.length);
     } catch (err) {
       log("✗ Direkter Abruf fehlgeschlagen:", err.message);
+      log("Status Code:", err.response?.statusCode);
+      
+      // Spezial-Behandlung für Amazon (oft 503/blocked)
+      if (targetUrl.includes('amazon.')) {
+        log("⚠️ Amazon erkannt - versuche alternativen Ansatz");
+        
+        // Warte kurz und versuche nochmal mit anderen Headers
+        await new Promise(r => setTimeout(r, 1000));
+        
+        try {
+          const response = await got(targetUrl, {
+            headers: {
+              ...headers,
+              'cookie': 'session-id=000-0000000-0000000', // Dummy-Cookie
+              'referer': 'https://www.google.com/',
+            },
+            http2: false,
+            decompress: true,
+            followRedirect: true,
+            timeout: { request: 15000 },
+            retry: { limit: 0 },
+          });
+          html = response.body;
+          log("✓ Amazon-Retry erfolgreich");
+        } catch (err3) {
+          log("✗ Amazon-Retry auch fehlgeschlagen");
+        }
+      }
       
       // Fallback: Jina Reader (nur wenn direkt scheitert)
-      const readerUrl = "https://r.jina.ai/" + targetUrl;
-      try {
-        html = await got(readerUrl, {
-          headers,
-          timeout: { request: 15000 },
-          retry: { limit: 0 },
-        }).text();
-        log("✓ Seite via Jina Reader geladen");
-      } catch (err2) {
-        log("✗ Jina Reader auch fehlgeschlagen:", err2.message);
+      if (!html) {
+        const readerUrl = "https://r.jina.ai/" + targetUrl;
+        try {
+          html = await got(readerUrl, {
+            headers,
+            timeout: { request: 15000 },
+            retry: { limit: 0 },
+          }).text();
+          log("✓ Seite via Jina Reader geladen");
+        } catch (err2) {
+          log("✗ Jina Reader auch fehlgeschlagen:", err2.message);
+        }
       }
     }
 
@@ -508,33 +540,60 @@ app.get("/api/img", async (req, res) => {
     return res.status(400).send("Bad image url");
   }
   
+  log("Image-Request für:", target);
+  
   try {
+    // Spezielle Behandlung für Amazon-Bilder
+    const isAmazon = target.includes('amazon') || target.includes('ssl-images-amazon');
+    
+    const headers = {
+      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+      "accept-language": "de-DE,de;q=0.9,en;q=0.8",
+    };
+    
+    // Für Amazon: Spezieller Referer
+    if (isAmazon) {
+      headers.referer = "https://www.amazon.de/";
+      log("Amazon-Bild erkannt, verwende Amazon-Referer");
+    } else {
+      try {
+        headers.referer = new URL(target).origin + "/";
+      } catch {
+        headers.referer = "https://www.google.com/";
+      }
+    }
+    
     const r = await got(target, {
       responseType: "buffer",
-      headers: {
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-        "accept-language": "de-DE,de;q=0.9,en;q=0.8",
-        referer: new URL(target).origin + "/",
-        "cache-control": "no-cache",
-        pragma: "no-cache",
-      },
+      headers,
       http2: false,
       followRedirect: true,
       decompress: true,
       timeout: { request: 12000 },
-      retry: { limit: 1 },
+      retry: { limit: 2 },
     });
 
+    log("✓ Bild erfolgreich geladen, Größe:", r.body.length);
+    
     res.setHeader("Content-Type", r.headers["content-type"] || "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400, immutable");
     res.setHeader("Access-Control-Allow-Origin", "*");
     return res.send(r.body);
   } catch (e) {
-    console.error("IMG proxy failed:", e.message);
+    console.error("IMG proxy failed:", e.message, "Status:", e.response?.statusCode);
+    log("Image-URL:", target);
+    
+    // Fallback: Leeres 1x1 Pixel Bild statt Fehler
+    res.setHeader("Content-Type", "image/png");
     res.setHeader("Access-Control-Allow-Origin", "*");
-    return res.status(502).send("");
+    
+    // Transparentes 1x1 PNG als Fallback
+    const emptyPng = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+      'base64'
+    );
+    return res.status(200).send(emptyPng);
   }
 });
 
