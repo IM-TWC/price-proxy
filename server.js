@@ -14,6 +14,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map((s) => s.trim());
 const DEBUG = process.env.DEBUG === "1";
+const USE_BROWSER = process.env.USE_BROWSER === "1"; // Headless Browser erlauben?
 
 app.use(
   cors({
@@ -85,32 +86,18 @@ const absolutize = (maybeUrl, base) => {
   }
 };
 
-// JSON Utility: Tiefen-Suche nach Preisen/Bildern in beliebigen Objekten
+// JSON-Blobs aus <script>-Tags (SPA) scannen
 const collectFromJSON = (obj, acc) => {
   if (!obj || typeof obj !== "object") return;
 
   const priceKeys = [
-    "price",
-    "currentPrice",
-    "salesPrice",
-    "salePrice",
-    "finalPrice",
-    "priceValue",
-    "unitPrice",
-    "lowPrice",
-    "offerPrice",
-    "amount",
-    "value",
+    "price", "currentPrice", "salesPrice", "salePrice",
+    "finalPrice", "priceValue", "unitPrice", "lowPrice",
+    "offerPrice", "amount", "value"
   ];
   const imageKeys = [
-    "image",
-    "imageUrl",
-    "imageURL",
-    "img",
-    "thumbnail",
-    "thumbnailUrl",
-    "primaryImage",
-    "mediaUrl",
+    "image", "imageUrl", "imageURL", "img", "thumbnail",
+    "thumbnailUrl", "primaryImage", "mediaUrl", "src", "url"
   ];
 
   if (Array.isArray(obj)) {
@@ -121,28 +108,23 @@ const collectFromJSON = (obj, acc) => {
   for (const [k, v] of Object.entries(obj)) {
     const lk = k.toLowerCase();
 
-    // Preisfelder (string/number)
     if (priceKeys.some((pk) => lk.includes(pk.toLowerCase()))) {
       const n = parsePriceNumber(v);
       if (n) acc.prices.push(n);
     }
 
-    // Bildfelder
     if (imageKeys.some((ik) => lk.includes(ik.toLowerCase()))) {
-      if (typeof v === "string") {
-        acc.images.push(v);
-      } else if (v && typeof v === "object") {
+      if (typeof v === "string") acc.images.push(v);
+      else if (v && typeof v === "object") {
         if (v.url) acc.images.push(v.url);
         if (v.src) acc.images.push(v.src);
       }
     }
 
-    // Schachtelung
     if (v && typeof v === "object") collectFromJSON(v, acc);
   }
 };
 
-// Extractor für JSON-Blobs in <script>-Tags (Shop-SPAs wie otto.de, etc.)
 const extractFromInlineJSON = ($, pageUrl) => {
   const acc = { prices: [], images: [] };
 
@@ -150,13 +132,11 @@ const extractFromInlineJSON = ($, pageUrl) => {
     const txt = $(el).text();
     if (!txt || txt.length < 40) return;
 
-    // Versuche strukturiert zu parsen
     let parsed = null;
     try {
-      // Manchmal kommt mehrfaches JSON nacheinander; versuch das erste gültige
       parsed = JSON.parse(txt);
     } catch {
-      // Kein reines JSON → versuche Zahlen „price": "12,34" per Regex zu greifen
+      // Versuche Preisstrings direkt zu fischen
       const priceRegexes = [
         /"price"\s*:\s*"([^"]+)"/gi,
         /"currentPrice"\s*:\s*"([^"]+)"/gi,
@@ -173,26 +153,21 @@ const extractFromInlineJSON = ($, pageUrl) => {
           if (n) acc.prices.push(n);
         }
       }
-
-      // Bilder innerhalb von JSON-ähnlichem Text
       const imgMatches = txt.match(/https?:\/\/[^\s"'\\)]+?\.(?:jpg|jpeg|png|webp)/gi);
       if (imgMatches) acc.images.push(...imgMatches);
       return;
     }
 
-    // Tiefen-Suche
     try {
       collectFromJSON(parsed, acc);
     } catch {}
   });
 
-  // Post-Processing Bilder (absolut machen & filtern)
   const imagesAbs = acc.images
     .map((u) => absolutize(u, pageUrl))
     .filter(Boolean)
     .filter((u) => !/sprite|icon|logo|placeholder|loading/i.test(u));
 
-  // Preise: nimm den plausibel kleinsten (Angebot) oder den häufigsten
   let price = null;
   if (acc.prices.length) {
     const freq = {};
@@ -208,14 +183,14 @@ const extractFromInlineJSON = ($, pageUrl) => {
 };
 
 /* =========================
-   Universal Extractor
+   Universal Extractor (statisch)
    ========================= */
 const universalExtract = ($, pageUrl) => {
   let price = null;
   let image = null;
   const strategies = [];
 
-  // 1) JSON-LD
+  // JSON-LD
   $('script[type="application/ld+json"]').each((_, el) => {
     if (price && image) return;
     try {
@@ -262,7 +237,7 @@ const universalExtract = ($, pageUrl) => {
     }
   });
 
-  // 2) Microdata
+  // Microdata
   if (!price) {
     const el = $('[itemprop="price"]').first();
     const val = el.attr("content") || el.text();
@@ -276,7 +251,7 @@ const universalExtract = ($, pageUrl) => {
     if (abs) { image = abs; strategies.push("microdata:image"); }
   }
 
-  // 3) OG/Twitter
+  // OG/Twitter
   if (!price) {
     const og =
       $('meta[property="product:price:amount"]').attr("content") ||
@@ -294,7 +269,7 @@ const universalExtract = ($, pageUrl) => {
     if (abs) { image = abs; strategies.push("og/twitter:image"); }
   }
 
-  // 4) data-*
+  // data-*
   if (!price) {
     const selectors = [
       "[data-price]",
@@ -317,28 +292,17 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // 5) CSS (priorisiert „current/sale/final“)
+  // CSS (priorisiert „current/sale/final“)
   if (!price) {
     const currentFirst = [
-      ".price--current",
-      ".price__current",
-      ".price-current",
-      ".current-price",
-      ".sales-price",
-      ".final-price",
-      ".priceToPay .a-offscreen",
-      ".a-price .a-offscreen",
+      ".price--current", ".price__current", ".price-current",
+      ".current-price", ".sales-price", ".final-price",
+      ".priceToPay .a-offscreen", ".a-price .a-offscreen",
     ];
     const genericLater = [
-      ".sale-price",
-      ".offer-price",
-      ".product-price",
-      ".price",
-      "#price",
-      "#priceblock_ourprice",
-      "#priceblock_dealprice",
-      ".a-price-whole",
-      "span.a-price > span.a-offscreen",
+      ".sale-price", ".offer-price", ".product-price", ".price",
+      "#price", "#priceblock_ourprice", "#priceblock_dealprice",
+      ".a-price-whole", "span.a-price > span.a-offscreen",
       "[data-a-color='price']",
       "[class*='price'][class*='current']",
       "[class*='Price']",
@@ -362,7 +326,7 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // 5.5) JSON-Blob-Extractor (SPAs wie OTTO)  << NEU
+  // JSON-Blob-Extractor (SPAs)
   if (!price || !image) {
     const fromJSON = extractFromInlineJSON($, pageUrl);
     if (!price && fromJSON.price) {
@@ -375,7 +339,7 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // 6) Regex-Fallback
+  // Regex-Fallback
   if (!price) {
     const body = $("body").text();
     const patterns = [
@@ -403,19 +367,14 @@ const universalExtract = ($, pageUrl) => {
     }
   }
 
-  // Bilder-Fallbacks
+  // Bild-Fallbacks
   if (!image) {
     const imageSelectors = [
-      "#landingImage",
-      "#imgBlkFront",
-      ".product-image img",
-      ".product-gallery img",
-      "#main-image",
-      "[data-testid='product-image']",
-      "[class*='ProductImage']",
-      "[class*='product-img']",
-      ".gallery-main img",
-      "[itemprop='image']",
+      "#landingImage", "#imgBlkFront",
+      ".product-image img", ".product-gallery img",
+      "#main-image", "[data-testid='product-image']",
+      "[class*='ProductImage']", "[class*='product-img']",
+      ".gallery-main img", "[itemprop='image']",
       "img[data-old-hires]",
     ];
     for (const sel of imageSelectors) {
@@ -444,14 +403,12 @@ const universalExtract = ($, pageUrl) => {
     if (abs) { image = abs; strategies.push("img:largest"); }
   }
 
-  // 7) Reconciliation (sichtbar niedrigerer Preis)
+  // Reconciliation: nimm plausibel sichtbaren Minimalpreis
   try {
     const text = $("body").text();
     const euroMatches = Array.from(
       text.matchAll(/(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€/g)
-    )
-      .map((m) => parsePriceNumber(m[1]))
-      .filter(Boolean);
+    ).map((m) => parsePriceNumber(m[1])).filter(Boolean);
     if (euroMatches.length) {
       const minVisible = Math.min(...euroMatches);
       if (price && minVisible < price && minVisible >= price * 0.5) {
@@ -465,11 +422,58 @@ const universalExtract = ($, pageUrl) => {
 };
 
 /* =========================
+   Headless Render (Playwright)
+   ========================= */
+let browserSingleton = null;
+async function getBrowser() {
+  if (!browserSingleton) {
+    const { chromium } = await import("playwright"); // dynamic import
+    browserSingleton = await chromium.launch({
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+    });
+  }
+  return browserSingleton;
+}
+
+async function renderWithBrowser(targetUrl, timeoutMs = 15000) {
+  const browser = await getBrowser();
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    bypassCSP: true,
+    javaScriptEnabled: true,
+  });
+  const page = await context.newPage();
+  try {
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+
+    // Cookie-Banner heuristisch „akzeptieren“
+    const acceptTexts = ["zustimmen", "akzeptieren", "alle akzeptieren", "accept all", "accept"];
+    for (const text of acceptTexts) {
+      const el = await page.$(`text=${text}`);
+      if (el) {
+        try { await el.click({ timeout: 1000 }); } catch {}
+      }
+    }
+
+    // warte kurz auf Preise/Bilder
+    await page.waitForTimeout(1200);
+
+    // Versuch: JSON-LD & DOM nachladen
+    const html = await page.content();
+    return html;
+  } finally {
+    await context.close();
+  }
+}
+
+/* =========================
    /api/price
    ========================= */
 app.get("/api/price", async (req, res) => {
   let targetUrl = (req.query.url || "").trim();
   const freshQuery = req.query.fresh === "1";
+  const forceRender = req.query.render === "1"; // manuell rendern
 
   try {
     if (!targetUrl) {
@@ -481,7 +485,7 @@ app.get("/api/price", async (req, res) => {
     }
     try { new URL(targetUrl); } catch { return res.status(400).json({ error: "Ungültige URL." }); }
 
-    // Option: Preisvergleich UTM -> fresh
+    // Preisvergleich-UTMs → fresh
     let forceFresh = freshQuery;
     try {
       const u = new URL(targetUrl);
@@ -506,8 +510,9 @@ app.get("/api/price", async (req, res) => {
     };
 
     let html = null;
+    let used = "direct";
 
-    // 1) Direkt
+    // 1) Direkt laden
     try {
       const resp = await got(targetUrl, {
         headers,
@@ -520,7 +525,7 @@ app.get("/api/price", async (req, res) => {
       html = resp.body;
       log("✓ Direkt geladen. Status:", resp.statusCode, "Len:", resp.body?.length);
     } catch (err) {
-      log("✗ Direkter Abruf fehlgeschlagen:", err.message, err.response?.statusCode);
+      log("✗ Direkt fehlgeschlagen:", err.message, err.response?.statusCode);
       if (targetUrl.includes("amazon.")) {
         try {
           const resp2 = await got(targetUrl, {
@@ -541,6 +546,7 @@ app.get("/api/price", async (req, res) => {
 
     // 2) Reader-Fallback
     if (!html) {
+      used = "reader";
       const readerUrl = "https://r.jina.ai/http://" + targetUrl.replace(/^https?:\/\//, "");
       try {
         html = await got(readerUrl, {
@@ -548,9 +554,22 @@ app.get("/api/price", async (req, res) => {
           timeout: { request: 15000 },
           retry: { limit: 0 },
         }).text();
-        log("✓ Via Jina Reader geladen");
+        log("✓ Via Reader geladen");
       } catch (err2) {
-        log("✗ Jina Reader fehlgeschlagen:", err2.message);
+        log("✗ Reader fehlgeschlagen:", err2.message);
+      }
+    }
+
+    // 3) Headless Render (falls erlaubt & nötig)
+    let viaBrowser = false;
+    if ((forceRender || USE_BROWSER) && (!html || used === "reader")) {
+      viaBrowser = true;
+      try {
+        html = await renderWithBrowser(targetUrl, 20000);
+        used = "browser";
+        log("✓ Headless-Render erfolgreich");
+      } catch (err3) {
+        log("✗ Headless-Render fehlgeschlagen:", err3.message);
       }
     }
 
@@ -563,17 +582,36 @@ app.get("/api/price", async (req, res) => {
     const { price, image, strategies } = universalExtract($, targetUrl);
 
     log("=== Ergebnis ===");
+    log("Quelle:", used, viaBrowser ? "(rendered)" : "");
     log("Preis:", price);
     log("Titel:", meta.title);
     log("Bild:", image || meta.image);
     log("Strategien:", strategies);
 
     if (!price) {
+      // Wenn Browser erlaubt & noch nicht verwendet → letzter Versuch
+      if (USE_BROWSER && !viaBrowser) {
+        try {
+          const html2 = await renderWithBrowser(targetUrl, 20000);
+          const $2 = cheerio.load(html2);
+          const meta2 = extractMeta($2);
+          const out2 = universalExtract($2, targetUrl);
+          if (out2.price) {
+            return res.json({
+              price: out2.price,
+              title: meta2.title,
+              image: out2.image || meta2.image || null,
+              strategies: DEBUG ? out2.strategies.concat(["final:browser"]) : undefined,
+            });
+          }
+        } catch {}
+      }
+
       return res.status(404).json({
         error: "Kein Preis gefunden",
         title: meta.title,
         image: image || meta.image || null,
-        debug: DEBUG 1 { strategies } : undefined,
+        debug: DEBUG ? { strategies, source: used } : undefined,
       });
     }
 
@@ -581,7 +619,7 @@ app.get("/api/price", async (req, res) => {
       price,
       title: meta.title,
       image: image || meta.image || null,
-      strategies: DEBUG ? strategies : undefined,
+      strategies: DEBUG ? strategies.concat([`source:${used}`]) : undefined,
     });
   } catch (err) {
     console.error("Proxy-Fehler /api/price:", err.message);
@@ -646,11 +684,11 @@ app.get("/api/img", async (req, res) => {
    Root & Health
    ========================= */
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("OK - Universal Price Proxy v2.2");
+  res.type("text/plain").send("OK - Universal Price Proxy v3 (static+browser)");
 });
 
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", version: "2.2", debug: DEBUG });
+  res.json({ status: "ok", version: "3.0", debug: DEBUG, browser: USE_BROWSER });
 });
 
 /* =========================
@@ -659,5 +697,6 @@ app.get("/health", (_req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Universal Price Proxy läuft auf Port ${PORT}`);
   console.log(`📊 Debug-Modus: ${DEBUG ? "AN" : "AUS"}`);
+  console.log(`🧭 Headless Browser: ${USE_BROWSER ? "AN" : "AUS"}`);
   console.log(`🌐 CORS Origins: ${ALLOWED_ORIGINS.join(", ")}`);
 });
