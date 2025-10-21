@@ -6,13 +6,14 @@ import { URL } from "url";
 
 const app = express();
 
-// --- Konfiguration ---
+/* =========================
+   Konfiguration
+   ========================= */
 const PORT = process.env.PORT || 3000;
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*")
   .split(",")
   .map((s) => s.trim());
-
-const DEBUG = process.env.DEBUG === "1"; // Setze DEBUG=1 für ausführliche Logs
+const DEBUG = process.env.DEBUG === "1"; // DEBUG=1 → ausführliche Logs
 
 app.use(
   cors({
@@ -25,51 +26,46 @@ app.use(
   })
 );
 
-// ---------- Helpers ----------
+/* =========================
+   Helpers
+   ========================= */
 const log = (...args) => {
   if (DEBUG) console.log("[DEBUG]", ...args);
 };
 
 const parsePriceNumber = (str) => {
   if (!str) return null;
-  
-  const cleaned = String(str)
-    .replace(/\s+/g, "") // Alle Whitespaces entfernen
-    .replace(/[^\d,.\-]/g, ""); // Nur Zahlen, Komma, Punkt, Minus
-  
-  // Verschiedene Formate unterstützen:
-  // 1.299,99 (DE) -> 1299.99
-  // 1,299.99 (US) -> 1299.99
-  // 1299.99
-  // 1299,99
-  
+
+  // Whitespace weg, nur Ziffern/Punkt/Komma/Minus behalten
+  const cleaned = String(str).replace(/\s+/g, "").replace(/[^\d,.\-]/g, "");
+
+  // Verschiedene internationalen Formate normalisieren:
+  // 1.299,99  -> 1299.99
+  // 1,299.99  -> 1299.99
+  // 1299,99   -> 1299.99
+  // 1299.99   -> 1299.99
   let normalized = cleaned;
-  
-  // Wenn sowohl Komma als auch Punkt vorhanden:
+
   if (normalized.includes(",") && normalized.includes(".")) {
-    // Bestimme welches das Dezimaltrennzeichen ist (das letzte)
     const lastComma = normalized.lastIndexOf(",");
     const lastDot = normalized.lastIndexOf(".");
-    
     if (lastComma > lastDot) {
-      // Komma ist Dezimaltrenner (DE-Format: 1.299,99)
-      normalized = normalized.replace(/\./g, "").replace(",", ".");
+      // Komma ist Dezimaltrenner (DE)
+      normalized = normalized.replace(/\.(?=\d{3}\b)/g, "").replace(",", ".");
     } else {
-      // Punkt ist Dezimaltrenner (US-Format: 1,299.99)
+      // Punkt ist Dezimaltrenner (US)
       normalized = normalized.replace(/,/g, "");
     }
   } else if (normalized.includes(",")) {
-    // Nur Komma: Könnte 1299,99 oder 1,299 sein
+    // Nur Komma vorhanden → entweder Dezimal- oder Tausendertrenner
     const parts = normalized.split(",");
     if (parts.length === 2 && parts[1].length <= 2) {
-      // Wahrscheinlich Dezimaltrenner: 1299,99
-      normalized = normalized.replace(",", ".");
+      normalized = normalized.replace(",", "."); // Dezimal
     } else {
-      // Wahrscheinlich Tausendertrenner: 1,299
-      normalized = normalized.replace(/,/g, "");
+      normalized = normalized.replace(/,/g, ""); // Tausender
     }
   }
-  
+
   const num = parseFloat(normalized);
   return Number.isFinite(num) && num > 0 ? num : null;
 };
@@ -82,36 +78,36 @@ const extractMeta = ($) => {
     $("h1").first().text()?.trim() ||
     null;
 
-  // Bild aus Meta-Tags
-  const ogImage =
+  const image =
     $('meta[property="og:image"]').attr("content") ||
     $('meta[property="og:image:secure_url"]').attr("content") ||
     $('meta[name="twitter:image"]').attr("content") ||
     $('link[rel="image_src"]').attr("href") ||
     null;
 
-  return { title, image: ogImage };
+  return { title, image };
 };
 
 const absolutize = (maybeUrl, base) => {
   if (!maybeUrl) return null;
   try {
-    // Relative URLs auflösen
     const absolute = new URL(maybeUrl, base).toString();
-    // Nur http(s) URLs zurückgeben
     return absolute.startsWith("http") ? absolute : null;
   } catch {
     return null;
   }
 };
 
-// ---------- Universal Extractor (Multi-Strategy) ----------
+/* =========================
+   Universal Extractor
+   (JSON-LD • Microdata • OG/Twitter • data-* • CSS • Regex)
+   ========================= */
 const universalExtract = ($, pageUrl) => {
   let price = null;
   let image = null;
   const strategies = [];
 
-  // STRATEGIE 1: JSON-LD (schema.org Product / Offer)
+  // 1) JSON-LD (schema.org Product/Offer, inkl. @graph)
   $('script[type="application/ld+json"]').each((_, el) => {
     if (price && image) return;
     try {
@@ -122,298 +118,215 @@ const universalExtract = ($, pageUrl) => {
 
       for (const obj of list) {
         if (!obj || typeof obj !== "object") continue;
+        const nodes = obj["@graph"] ? obj["@graph"] : [obj];
 
-        // Rekursiv durch @graph gehen
-        const items = obj["@graph"] ? obj["@graph"] : [obj];
-        
-        for (const item of items) {
-          if (item["@type"] === "Product" || item["@type"] === "Offer") {
-            // Preis aus offers
-            const offers = item.offers || item.Offer || [];
+        for (const node of nodes) {
+          if (node["@type"] === "Product" || node["@type"] === "Offer") {
+            const offers = node.offers || node.Offer || [];
             const offerList = Array.isArray(offers) ? offers : [offers];
-            
+
             for (const offer of offerList) {
-              if (!price && offer.price) {
+              if (!price && offer?.price) {
                 const n = parsePriceNumber(offer.price);
-                if (n) {
-                  price = n;
-                  strategies.push("JSON-LD:offers.price");
-                  log("✓ Preis gefunden via JSON-LD offers:", n);
-                }
+                if (n) { price = n; strategies.push("JSON-LD:offers.price"); }
               }
-              if (!price && offer.lowPrice) {
+              if (!price && offer?.lowPrice) {
                 const n = parsePriceNumber(offer.lowPrice);
-                if (n) {
-                  price = n;
-                  strategies.push("JSON-LD:lowPrice");
-                }
+                if (n) { price = n; strategies.push("JSON-LD:offers.lowPrice"); }
               }
             }
-            
-            // Direkter price-Wert
-            if (!price && item.price) {
-              const n = parsePriceNumber(item.price);
-              if (n) {
-                price = n;
-                strategies.push("JSON-LD:price");
-                log("✓ Preis gefunden via JSON-LD direct:", n);
-              }
+            if (!price && node?.price) {
+              const n = parsePriceNumber(node.price);
+              if (n) { price = n; strategies.push("JSON-LD:price"); }
             }
 
-            // Bild
             if (!image) {
-              const imgCand = Array.isArray(item.image) 
-                ? item.image[0] 
-                : item.image;
-              if (imgCand) {
-                const imgUrl = typeof imgCand === "object" ? imgCand.url : imgCand;
-                image = absolutize(imgUrl, pageUrl);
-                if (image) {
-                  strategies.push("JSON-LD:image");
-                  log("✓ Bild gefunden via JSON-LD:", image);
-                }
-              }
+              const imgCand = Array.isArray(node.image) ? node.image[0] : node.image;
+              const imgUrl = typeof imgCand === "object" ? imgCand?.url : imgCand;
+              const abs = absolutize(imgUrl, pageUrl);
+              if (abs) { image = abs; strategies.push("JSON-LD:image"); }
             }
           }
         }
       }
     } catch (err) {
-      log("JSON-LD Parse-Fehler:", err.message);
+      log("JSON-LD parse error:", err.message);
     }
   });
 
-  // STRATEGIE 2: Microdata (itemprop)
+  // 2) Microdata / itemprop
   if (!price) {
-    const microPrice = $('[itemprop="price"]');
-    if (microPrice.length) {
-      const val = microPrice.attr("content") || microPrice.text();
-      const n = parsePriceNumber(val);
-      if (n) {
-        price = n;
-        strategies.push("microdata:itemprop=price");
-        log("✓ Preis gefunden via Microdata:", n);
-      }
-    }
+    const el = $('[itemprop="price"]').first();
+    const val = el.attr("content") || el.text();
+    const n = parsePriceNumber(val);
+    if (n) { price = n; strategies.push("microdata:price"); }
   }
-  
   if (!image) {
-    const microImg = $('[itemprop="image"]').first();
-    const imgSrc = microImg.attr("src") || microImg.attr("content");
-    if (imgSrc) {
-      image = absolutize(imgSrc, pageUrl);
-      if (image) strategies.push("microdata:itemprop=image");
-    }
+    const img = $('[itemprop="image"]').first();
+    const src = img.attr("src") || img.attr("content");
+    const abs = absolutize(src, pageUrl);
+    if (abs) { image = abs; strategies.push("microdata:image"); }
   }
 
-  // STRATEGIE 3: Open Graph / Twitter Cards
+  // 3) OG/Twitter
   if (!price) {
-    const ogPrice =
+    const og =
       $('meta[property="product:price:amount"]').attr("content") ||
       $('meta[property="og:price:amount"]').attr("content") ||
       $('meta[name="twitter:data1"]').attr("content") ||
       null;
-    if (ogPrice) {
-      const n = parsePriceNumber(ogPrice);
-      if (n) {
-        price = n;
-        strategies.push("og:price");
-        log("✓ Preis gefunden via Open Graph:", n);
-      }
-    }
+    const n = parsePriceNumber(og);
+    if (n) { price = n; strategies.push("og/twitter:price"); }
+  }
+  if (!image) {
+    const metaImg =
+      $('meta[property="og:image"]').attr("content") ||
+      $('meta[name="twitter:image"]').attr("content");
+    const abs = absolutize(metaImg, pageUrl);
+    if (abs) { image = abs; strategies.push("og/twitter:image"); }
   }
 
-  // STRATEGIE 4: Data-Attribute (häufig bei SPAs)
+  // 4) data-* Attrs (häufig bei SPAs)
   if (!price) {
     const selectors = [
-      '[data-price]',
-      '[data-price-amount]', 
-      '[data-product-price]',
-      '[data-test-id*="price"]',
-      '[data-testid*="price"]',
-      '[data-cy*="price"]'
+      "[data-price]",
+      "[data-price-amount]",
+      "[data-product-price]",
+      "[data-test-id*='price']",
+      "[data-testid*='price']",
+      "[data-cy*='price']",
     ];
-    
     for (const sel of selectors) {
       const el = $(sel).first();
-      if (el.length) {
-        const val = el.attr('data-price') || 
-                   el.attr('data-price-amount') || 
-                   el.attr('data-product-price') ||
-                   el.text();
-        const n = parsePriceNumber(val);
-        if (n) {
-          price = n;
-          strategies.push(`data-attr:${sel}`);
-          log("✓ Preis gefunden via data-attribute:", n);
-          break;
-        }
-      }
+      if (!el.length) continue;
+      const val =
+        el.attr("data-price") ||
+        el.attr("data-price-amount") ||
+        el.attr("data-product-price") ||
+        el.text();
+      const n = parsePriceNumber(val);
+      if (n) { price = n; strategies.push(`data-attr:${sel}`); break; }
     }
   }
 
-  // STRATEGIE 5: Häufige CSS-Klassen/IDs
+  // 5) Häufige CSS-Selektoren
   if (!price) {
     const priceSelectors = [
-      '.price',
-      '.product-price',
-      '.current-price',
-      '.sale-price',
-      '.offer-price',
-      '#price',
-      '#priceblock_ourprice',
-      '#priceblock_dealprice',
-      '.a-price .a-offscreen', // Amazon
-      '.a-price-whole', // Amazon
-      'span.a-price > span.a-offscreen', // Amazon spezifisch
-      '[data-a-color="price"]', // Amazon
-      '.priceToPay .a-offscreen', // Amazon neueres Format
-      '[class*="price"][class*="current"]',
-      '[class*="Price"]'
+      ".price",
+      ".product-price",
+      ".current-price",
+      ".sale-price",
+      ".offer-price",
+      "#price",
+      "#priceblock_ourprice",
+      "#priceblock_dealprice",
+      ".a-price .a-offscreen",
+      ".a-price-whole",
+      "span.a-price > span.a-offscreen",
+      '[data-a-color="price"]',
+      ".priceToPay .a-offscreen",
+      "[class*='price'][class*='current']",
+      "[class*='Price']",
     ];
-    
     for (const sel of priceSelectors) {
       const el = $(sel).first();
-      if (el.length) {
-        const text = el.text();
-        const n = parsePriceNumber(text);
-        if (n) {
-          price = n;
-          strategies.push(`css:${sel}`);
-          log("✓ Preis gefunden via CSS-Selektor:", sel, n);
-          break;
-        }
-      }
+      if (!el.length) continue;
+      const n = parsePriceNumber(el.text());
+      if (n) { price = n; strategies.push(`css:${sel}`); break; }
     }
   }
 
-  // STRATEGIE 6: Regex im sichtbaren Text (letzte Rettung)
+  // 6) Regex (letzter Fallback)
   if (!price) {
-    const bodyText = $("body").text();
-    
-    // Verschiedene Preis-Patterns
+    const body = $("body").text();
     const patterns = [
-      /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€/g,           // 1.299,99 € oder 1,299.99 €
-      /€\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/g,           // € 1.299,99
-      /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*EUR/gi,        // 1299.99 EUR
-      /EUR\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/gi,        // EUR 1299.99
-      /(\d+[.,]\d{2})\s*€/g,                             // 99.99 € oder 99,99 €
+      /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*€/g,
+      /€\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/g,
+      /(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*EUR/gi,
+      /EUR\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})/gi,
+      /(\d+[.,]\d{2})\s*€/g,
     ];
-    
-    const foundPrices = [];
-    for (const pattern of patterns) {
-      const matches = bodyText.matchAll(pattern);
-      for (const match of matches) {
-        const n = parsePriceNumber(match[1]);
-        if (n && n > 0 && n < 1000000) { // Realistischer Bereich
-          foundPrices.push(n);
-        }
+    const found = [];
+    for (const re of patterns) {
+      for (const m of body.matchAll(re)) {
+        const n = parsePriceNumber(m[1]);
+        if (n && n > 0 && n < 1_000_000) found.push(n);
       }
     }
-    
-    if (foundPrices.length > 0) {
-      // Nimm den häufigsten Preis (Mode) oder den kleinsten, wenn alle einzigartig
-      const frequency = {};
-      foundPrices.forEach(p => frequency[p] = (frequency[p] || 0) + 1);
-      const sorted = Object.entries(frequency).sort((a, b) => b[1] - a[1]);
+    if (found.length) {
+      // häufigsten Wert nehmen (oder kleinsten bei Gleichstand)
+      const freq = {};
+      for (const p of found) freq[p] = (freq[p] || 0) + 1;
+      const sorted = Object.entries(freq).sort((a, b) =>
+        b[1] === a[1] ? Number(a[0]) - Number(b[0]) : b[1] - a[1]
+      );
       price = parseFloat(sorted[0][0]);
-      strategies.push("regex:body-text");
-      log("✓ Preis gefunden via Regex im Body:", price, `(${foundPrices.length} Kandidaten)`);
+      strategies.push("regex:body");
     }
   }
 
-  // BILD-STRATEGIE: Bessere Produkt-Bild-Erkennung
+  // Bild-Fallbacks (grösstes plausibles Bild)
   if (!image) {
-    // Versuche spezifische Produkt-Bild-Container
     const imageSelectors = [
-      '#landingImage', // Amazon Hauptbild
-      '#imgBlkFront', // Amazon alternativ
-      '.product-image img',
-      '.product-gallery img',
-      '#main-image',
-      '[data-testid="product-image"]',
-      '[class*="ProductImage"]',
-      '[class*="product-img"]',
-      '.gallery-main img',
-      '[itemprop="image"]',
-      'img[data-old-hires]', // Amazon hochauflösend
+      "#landingImage",
+      "#imgBlkFront",
+      ".product-image img",
+      ".product-gallery img",
+      "#main-image",
+      "[data-testid='product-image']",
+      "[class*='ProductImage']",
+      "[class*='product-img']",
+      ".gallery-main img",
+      "[itemprop='image']",
+      "img[data-old-hires]",
     ];
-    
     for (const sel of imageSelectors) {
       const img = $(sel).first();
-      if (img.length) {
-        const src = img.attr("src") || img.attr("data-src") || img.attr("data-lazy");
-        if (src) {
-          image = absolutize(src, pageUrl);
-          if (image && !image.includes("placeholder") && !image.includes("loading")) {
-            strategies.push(`img:${sel}`);
-            log("✓ Bild gefunden via Selektor:", sel);
-            break;
-          }
-        }
+      const src = img.attr("src") || img.attr("data-src") || img.attr("data-lazy");
+      const abs = absolutize(src, pageUrl);
+      if (abs && !abs.includes("placeholder") && !abs.includes("loading")) {
+        image = abs;
+        strategies.push(`img:${sel}`);
+        break;
       }
     }
   }
-  
-  // Fallback: Größtes Bild auf der Seite (> 200x200px)
   if (!image) {
-    let bestImg = null;
-    let maxSize = 0;
-    
+    let best = null, maxArea = 0;
     $("img").each((_, el) => {
       const src = $(el).attr("src") || $(el).attr("data-src");
       if (!src) return;
-      
-      // Überspringe Icons, Logos, etc.
       if (src.includes("icon") || src.includes("logo") || src.includes("sprite")) return;
-      
-      const width = parseInt($(el).attr("width")) || 0;
-      const height = parseInt($(el).attr("height")) || 0;
-      const size = width * height;
-      
-      if (size > maxSize && size > 40000) { // Mindestens ~200x200
-        maxSize = size;
-        bestImg = src;
-      }
+      const w = parseInt($(el).attr("width")) || 0;
+      const h = parseInt($(el).attr("height")) || 0;
+      const area = w * h;
+      if (area > maxArea && area > 40000) { maxArea = area; best = src; }
     });
-    
-    if (bestImg) {
-      image = absolutize(bestImg, pageUrl);
-      if (image) {
-        strategies.push("img:largest");
-        log("✓ Bild gefunden via largest-image:", image);
-      }
-    }
+    const abs = absolutize(best, pageUrl);
+    if (abs) { image = abs; strategies.push("img:largest"); }
   }
 
-  log("Verwendete Strategien:", strategies.join(", "));
   return { price, image, strategies };
 };
 
-// ---------- Preis aus Direktlink ----------
+/* =========================
+   /api/price
+   ========================= */
 app.get("/api/price", async (req, res) => {
-  let targetUrl = req.query.url;
+  let targetUrl = (req.query.url || "").trim();
   const fresh = req.query.fresh === "1";
-  
+
   try {
     if (!targetUrl) {
       return res.status(400).json({ error: "Parameter 'url' fehlt." });
     }
-    
-    // Auto-Korrektur: https:// hinzufügen wenn fehlt
-    targetUrl = targetUrl.trim();
     if (!/^https?:\/\//i.test(targetUrl)) {
-      targetUrl = 'https://' + targetUrl;
-      log("URL korrigiert zu:", targetUrl);
+      targetUrl = "https://" + targetUrl;
+      log("URL korrigiert:", targetUrl);
     }
-    
-    // Validierung nach Korrektur
-    try {
-      new URL(targetUrl); // Wirft Error wenn ungültig
-    } catch {
-      return res.status(400).json({ error: "Ungültige URL-Format." });
-    }
+    try { new URL(targetUrl); } catch { return res.status(400).json({ error: "Ungültige URL." }); }
 
-    log("\n=== Neue Anfrage ===");
+    log("\n=== Anfrage ===");
     log("URL:", targetUrl);
 
     const headers = {
@@ -432,9 +345,9 @@ app.get("/api/price", async (req, res) => {
 
     let html = null;
 
-    // Direkter Abruf
+    // 1) Direkt
     try {
-      const response = await got(targetUrl, {
+      const resp = await got(targetUrl, {
         headers,
         http2: false,
         decompress: true,
@@ -442,80 +355,64 @@ app.get("/api/price", async (req, res) => {
         timeout: { request: 15000 },
         retry: { limit: 1 },
       });
-      html = response.body;
-      log("✓ Seite erfolgreich geladen (direkt)");
-      log("Response status:", response.statusCode);
-      log("Content-Length:", response.body?.length);
+      html = resp.body;
+      log("✓ Direkt geladen. Status:", resp.statusCode, "Len:", resp.body?.length);
     } catch (err) {
-      log("✗ Direkter Abruf fehlgeschlagen:", err.message);
-      log("Status Code:", err.response?.statusCode);
-      
-      // Spezial-Behandlung für Amazon (oft 503/blocked)
-      if (targetUrl.includes('amazon.')) {
-        log("⚠️ Amazon erkannt - versuche alternativen Ansatz");
-        
-        // Warte kurz und versuche nochmal mit anderen Headers
-        await new Promise(r => setTimeout(r, 1000));
-        
+      log("✗ Direkter Abruf fehlgeschlagen:", err.message, err.response?.statusCode);
+      // Sonderfall Amazon: kurzer Retry mit Referer/Cookie
+      if (targetUrl.includes("amazon.")) {
         try {
-          const response = await got(targetUrl, {
-            headers: {
-              ...headers,
-              'cookie': 'session-id=000-0000000-0000000', // Dummy-Cookie
-              'referer': 'https://www.google.com/',
-            },
+          const resp2 = await got(targetUrl, {
+            headers: { ...headers, referer: "https://www.google.com/", cookie: "session-id=000-0000000-0000000" },
             http2: false,
             decompress: true,
             followRedirect: true,
             timeout: { request: 15000 },
             retry: { limit: 0 },
           });
-          html = response.body;
+          html = resp2.body;
           log("✓ Amazon-Retry erfolgreich");
-        } catch (err3) {
-          log("✗ Amazon-Retry auch fehlgeschlagen");
-        }
-      }
-      
-      // Fallback: Jina Reader (nur wenn direkt scheitert)
-      if (!html) {
-        const readerUrl = "https://r.jina.ai/" + targetUrl;
-        try {
-          html = await got(readerUrl, {
-            headers,
-            timeout: { request: 15000 },
-            retry: { limit: 0 },
-          }).text();
-          log("✓ Seite via Jina Reader geladen");
-        } catch (err2) {
-          log("✗ Jina Reader auch fehlgeschlagen:", err2.message);
+        } catch {
+          log("✗ Amazon-Retry fehlgeschlagen");
         }
       }
     }
 
+    // 2) Reader-Fallback (liefert reinen Content)
     if (!html) {
-      return res.status(502).json({ 
-        error: "Seite konnte nicht geladen werden", 
-        url: targetUrl 
-      });
+      const readerUrl = "https://r.jina.ai/http://" + targetUrl.replace(/^https?:\/\//, "");
+      try {
+        html = await got(readerUrl, {
+          headers,
+          timeout: { request: 15000 },
+          retry: { limit: 0 },
+        }).text();
+        log("✓ Via Jina Reader geladen");
+      } catch (err2) {
+        log("✗ Jina Reader fehlgeschlagen:", err2.message);
+      }
+    }
+
+    if (!html) {
+      return res.status(502).json({ error: "Seite konnte nicht geladen werden", url: targetUrl });
     }
 
     const $ = cheerio.load(html);
     const meta = extractMeta($);
     const { price, image, strategies } = universalExtract($, targetUrl);
 
-    log("\n=== Ergebnis ===");
+    log("=== Ergebnis ===");
     log("Preis:", price);
     log("Titel:", meta.title);
     log("Bild:", image || meta.image);
     log("Strategien:", strategies);
 
     if (!price) {
-      return res.status(404).json({ 
-        error: "Kein Preis gefunden", 
-        title: meta.title, 
-        image: image || meta.image,
-        debug: DEBUG ? { strategies } : undefined
+      return res.status(404).json({
+        error: "Kein Preis gefunden",
+        title: meta.title,
+        image: image || meta.image || null,
+        debug: DEBUG ? { strategies } : undefined,
       });
     }
 
@@ -525,7 +422,6 @@ app.get("/api/price", async (req, res) => {
       image: image || meta.image || null,
       strategies: DEBUG ? strategies : undefined,
     });
-    
   } catch (err) {
     console.error("Proxy-Fehler /api/price:", err.message);
     log("Stack:", err.stack);
@@ -533,85 +429,57 @@ app.get("/api/price", async (req, res) => {
   }
 });
 
-// ---------- Bild-Proxy (gegen Hotlink/CORS/Referrer) ----------
+/* =========================
+   /api/img  (Bild-Proxy)
+   ========================= */
 app.get("/api/img", async (req, res) => {
   const target = req.query.url;
   if (!target || !/^https?:\/\//i.test(target)) {
     return res.status(400).send("Bad image url");
   }
-  
-  log("Image-Request für:", target);
-  
   try {
-    // Spezielle Behandlung für Amazon-Bilder
-    const isAmazon = target.includes('amazon') || target.includes('ssl-images-amazon');
-    
-    const headers = {
-      "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-      "accept-language": "de-DE,de;q=0.9,en;q=0.8",
-    };
-    
-    // Für Amazon: Spezieller Referer
-    if (isAmazon) {
-      headers.referer = "https://www.amazon.de/";
-      log("Amazon-Bild erkannt, verwende Amazon-Referer");
-    } else {
-      try {
-        headers.referer = new URL(target).origin + "/";
-      } catch {
-        headers.referer = "https://www.google.com/";
-      }
-    }
-    
     const r = await got(target, {
       responseType: "buffer",
-      headers,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "accept-language": "de-DE,de;q=0.9,en;q=0.8",
+        referer: new URL(target).origin + "/",
+        "cache-control": "no-cache",
+        pragma: "no-cache",
+      },
       http2: false,
       followRedirect: true,
       decompress: true,
       timeout: { request: 12000 },
-      retry: { limit: 2 },
+      retry: { limit: 1 },
     });
-
-    log("✓ Bild erfolgreich geladen, Größe:", r.body.length);
-    
     res.setHeader("Content-Type", r.headers["content-type"] || "image/jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400, immutable");
     res.setHeader("Access-Control-Allow-Origin", "*");
     return res.send(r.body);
   } catch (e) {
-    console.error("IMG proxy failed:", e.message, "Status:", e.response?.statusCode);
-    log("Image-URL:", target);
-    
-    // Fallback: Leeres 1x1 Pixel Bild statt Fehler
-    res.setHeader("Content-Type", "image/png");
+    console.error("IMG proxy failed:", e.message);
     res.setHeader("Access-Control-Allow-Origin", "*");
-    
-    // Transparentes 1x1 PNG als Fallback
-    const emptyPng = Buffer.from(
-      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
-      'base64'
-    );
-    return res.status(200).send(emptyPng);
+    return res.status(502).send("");
   }
 });
 
-// ---------- Root ----------
+/* =========================
+   Root & Health
+   ========================= */
 app.get("/", (_req, res) => {
   res.type("text/plain").send("OK - Universal Price Proxy v2.0");
 });
 
-// ---------- Health Check ----------
 app.get("/health", (_req, res) => {
-  res.json({ 
-    status: "ok", 
-    version: "2.0",
-    debug: DEBUG 
-  });
+  res.json({ status: "ok", version: "2.0", debug: DEBUG });
 });
 
-// ---------- Start ----------
+/* =========================
+   Start
+   ========================= */
 app.listen(PORT, () => {
   console.log(`🚀 Universal Price Proxy läuft auf Port ${PORT}`);
   console.log(`📊 Debug-Modus: ${DEBUG ? "AN" : "AUS"}`);
